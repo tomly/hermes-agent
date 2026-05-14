@@ -316,6 +316,63 @@ def _recoverable_oneshot_run_at(
     return None
 
 
+def _recoverable_recurring_next_run(
+    schedule: Dict[str, Any],
+    now: datetime,
+    *,
+    last_run_at: Optional[str] = None,
+) -> Optional[str]:
+    """Return a recovered next_run_at for cron/interval jobs with missing next_run_at.
+
+    When next_run_at is lost (e.g., due to manual recovery operations or corruption),
+    this function computes the correct next run time based on the schedule expression.
+
+    For interval jobs: next_run = (last_run_at or now) + interval
+    For cron jobs: next_run = next occurrence from now (or from last_run_at if within grace)
+
+    This prevents recurring jobs from being "forgotten" when next_run_at is missing.
+    """
+    kind = schedule.get("kind")
+    if kind not in ("cron", "interval"):
+        return None
+
+    # Job already ran — don't recover for one-shot-like behavior
+    # But for recurring, we can still compute next run from last_run_at
+    if kind == "interval":
+        minutes = schedule.get("minutes", 1)
+        if last_run_at:
+            # Compute from last run to maintain correct cadence
+            last = _ensure_aware(datetime.fromisoformat(last_run_at))
+            next_run = last + timedelta(minutes=minutes)
+            # If next_run is in the past (more than grace window), fast-forward
+            grace = _compute_grace_seconds(schedule)
+            if (now - next_run).total_seconds() > grace:
+                next_run = now + timedelta(minutes=minutes)
+        else:
+            # No last run — start fresh from now
+            next_run = now + timedelta(minutes=minutes)
+        return next_run.isoformat()
+
+    if kind == "cron":
+        if not HAS_CRONITER:
+            return None
+        expr = schedule.get("expr")
+        if not expr:
+            return None
+
+        # For cron, always compute next occurrence from now
+        # (last_run_at is unreliable for cron recovery since we don't know
+        # if the schedule was meant to run at a specific time relative to last_run)
+        try:
+            cron = croniter(expr, now)
+            next_run = cron.get_next(datetime)
+            return next_run.isoformat()
+        except Exception:
+            return None
+
+    return None
+
+
 def _compute_grace_seconds(schedule: dict) -> int:
     """Compute how late a job can be and still catch up instead of fast-forwarding.
 

@@ -866,3 +866,177 @@ class TestSaveJobOutput:
         assert output_file.exists()
         assert output_file.read_text() == "# Results\nEverything ok."
         assert "test123" in str(output_file)
+
+
+class TestRecurringNextRunRecovery:
+    """Tests for _recoverable_recurring_next_run() — recovery of cron/interval jobs with missing next_run_at."""
+
+    def test_interval_without_next_run_is_recovered(self, tmp_cron_dir, monkeypatch):
+        """Interval jobs with missing next_run_at should be recovered to the next future run."""
+        now = datetime(2026, 3, 18, 10, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs(
+            [{
+                "id": "interval-recover",
+                "name": "Recover interval",
+                "prompt": "Check every hour",
+                "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"},
+                "schedule_display": "every 60m",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "created_at": "2026-03-18T09:00:00+00:00",
+                "next_run_at": None,  # Missing!
+                "last_run_at": None,
+                "last_status": None,
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+            }]
+        )
+
+        due = get_due_jobs()
+
+        # Job should NOT be due (recovered next_run_at is in the future)
+        assert len(due) == 0
+
+        # next_run_at should be recovered to ~now + 60min
+        updated = get_job("interval-recover")
+        assert updated["next_run_at"] is not None
+        next_dt = datetime.fromisoformat(updated["next_run_at"])
+        expected = now + timedelta(minutes=60)
+        # Allow 1 minute tolerance
+        assert abs((next_dt - expected).total_seconds()) < 60
+
+    def test_interval_with_last_run_recovered_correctly(self, tmp_cron_dir, monkeypatch):
+        """Interval jobs with last_run_at should recover based on last run + interval.
+
+        When recovered time is past grace window, it gets fast-forwarded.
+        """
+        now = datetime(2026, 3, 18, 10, 40, 0, tzinfo=timezone.utc)  # 40min past 10:00, beyond grace
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        # Job ran at 09:00, interval is 60min, so next should be 10:00
+        # now is 10:40, so it's past grace window (30min for hourly) → should fast-forward
+        save_jobs(
+            [{
+                "id": "interval-recover-last",
+                "name": "Recover with last run",
+                "prompt": "Check every hour",
+                "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"},
+                "schedule_display": "every 60m",
+                "repeat": {"times": None, "completed": 1},
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "created_at": "2026-03-18T08:00:00+00:00",
+                "next_run_at": None,  # Missing!
+                "last_run_at": "2026-03-18T09:00:00+00:00",
+                "last_status": "ok",
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+            }]
+        )
+
+        due = get_due_jobs()
+
+        # Job should NOT be due (recovered and fast-forwarded)
+        assert len(due) == 0
+
+        # next_run_at should be ~now + 60min (fast-forwarded since last_run + interval is past)
+        updated = get_job("interval-recover-last")
+        assert updated["next_run_at"] is not None
+        next_dt = datetime.fromisoformat(updated["next_run_at"])
+        # Should be fast-forwarded to now + 60min = 11:40
+        expected = now + timedelta(minutes=60)
+        assert abs((next_dt - expected).total_seconds()) < 60
+
+    def test_cron_without_next_run_is_recovered(self, tmp_cron_dir, monkeypatch):
+        """Cron jobs with missing next_run_at should be recovered to the next occurrence."""
+        pytest.importorskip("croniter")
+        now = datetime(2026, 3, 18, 10, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        # Daily at 09:00 — next occurrence should be 2026-03-19T09:00
+        save_jobs(
+            [{
+                "id": "cron-recover",
+                "name": "Recover cron",
+                "prompt": "Daily report",
+                "schedule": {"kind": "cron", "expr": "0 9 * * *", "display": "0 9 * * *"},
+                "schedule_display": "0 9 * * *",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "created_at": "2026-03-17T09:00:00+00:00",
+                "next_run_at": None,  # Missing!
+                "last_run_at": None,
+                "last_status": None,
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+            }]
+        )
+
+        due = get_due_jobs()
+
+        # Job should NOT be due (recovered next_run_at is tomorrow 09:00)
+        assert len(due) == 0
+
+        # next_run_at should be recovered to tomorrow 09:00
+        updated = get_job("cron-recover")
+        assert updated["next_run_at"] is not None
+        next_dt = datetime.fromisoformat(updated["next_run_at"])
+        # Should be 2026-03-19T09:00
+        expected = datetime(2026, 3, 19, 9, 0, 0, tzinfo=timezone.utc)
+        assert abs((next_dt - expected).total_seconds()) < 60
+
+    def test_interval_due_within_grace_after_recovery(self, tmp_cron_dir, monkeypatch):
+        """Interval jobs recovered within grace window should be due."""
+        now = datetime(2026, 3, 18, 10, 5, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        # Job ran at 09:00, interval is 60min
+        # last_run_at + interval = 10:00, now is 10:05 (within grace)
+        # So recovered next_run_at should be 10:00, and job should be due
+        save_jobs(
+            [{
+                "id": "interval-due",
+                "name": "Due after recovery",
+                "prompt": "Check every hour",
+                "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"},
+                "schedule_display": "every 60m",
+                "repeat": {"times": None, "completed": 1},
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "created_at": "2026-03-18T08:00:00+00:00",
+                "next_run_at": None,  # Missing!
+                "last_run_at": "2026-03-18T09:00:00+00:00",
+                "last_status": "ok",
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+            }]
+        )
+
+        due = get_due_jobs()
+
+        # Job SHOULD be due (recovered to 10:00, within grace window of 10:05)
+        assert len(due) == 1
+        assert due[0]["id"] == "interval-due"
+
+        # next_run_at should be recovered to 10:00
+        updated = get_job("interval-due")
+        assert updated["next_run_at"] is not None
+        next_dt = datetime.fromisoformat(updated["next_run_at"])
+        expected = datetime(2026, 3, 18, 10, 0, 0, tzinfo=timezone.utc)
+        assert abs((next_dt - expected).total_seconds()) < 60
