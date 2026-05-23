@@ -167,6 +167,20 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     return None
 
 
+def _resolve_schedule(job: dict) -> Optional[dict]:
+    """Extract schedule dict from a job, handling non-dict values gracefully.
+
+    Treats non-dict schedules (legacy string expressions like '0 9 * * *',
+    integers, or lists) as missing instead of crashing with TypeError on
+    ``schedule.get(...)``. Guards against jobs created via API/script with
+    malformed schedule fields.
+    """
+    schedule = job.get("schedule")
+    if not isinstance(schedule, dict):
+        return None
+    return schedule
+
+
 def _plugin_cron_env_var(platform_name: str) -> str:
     """Return the cron home-channel env var registered by a plugin platform.
 

@@ -96,6 +96,20 @@ def _schedule_display_for_job(job: Dict[str, Any]) -> str:
     return "?"
 
 
+def _resolve_job_schedule(job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Extract schedule dict from a job, handling non-dict values gracefully.
+
+    Treats non-dict schedules (legacy string expressions like '0 9 * * *',
+    integers, or lists) as missing instead of crashing with TypeError on
+    ``schedule.get(...)``. Guards against jobs created via API/script with
+    malformed schedule fields.
+    """
+    schedule = job.get("schedule")
+    if not isinstance(schedule, dict):
+        return None
+    return schedule
+
+
 def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     """Return a read-safe cron job shape for UI/API/tool/scheduler consumers.
 
@@ -867,7 +881,8 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # missing runtime dep into "job completed" and the user's
                 # schedule quietly goes off. See issue #16265.
                 if job["next_run_at"] is None:
-                    kind = job.get("schedule", {}).get("kind")
+                    schedule = _resolve_job_schedule(job)
+                    kind = schedule.get("kind") if schedule else None
                     if kind in {"cron", "interval"}:
                         job["state"] = "error"
                         if not job.get("last_error"):
@@ -911,7 +926,8 @@ def advance_next_run(job_id: str) -> bool:
         jobs = load_jobs()
         for job in jobs:
             if job["id"] == job_id:
-                kind = job.get("schedule", {}).get("kind")
+                schedule = _resolve_job_schedule(job)
+                kind = schedule.get("kind") if schedule else None
                 if kind not in {"cron", "interval"}:
                     return False
                 now = _hermes_now().isoformat()
@@ -950,7 +966,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
 
         next_run = job.get("next_run_at")
         if not next_run:
-            schedule = job.get("schedule", {})
+            schedule = _resolve_job_schedule(job) or {}
             kind = schedule.get("kind")
 
             # One-shot jobs use a small grace window via the dedicated helper.
@@ -967,7 +983,9 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             # silently skipped forever; recompute next_run_at from the
             # schedule so they pick up at their next scheduled tick.
             if not recovered_next and kind in {"cron", "interval"}:
-                recovered_next = compute_next_run(schedule, now.isoformat())
+                # Use job's last_run_at to compute next run, not current time.
+                # This preserves the original schedule cadence.
+                recovered_next = compute_next_run(schedule, job.get("last_run_at"))
                 if recovered_next:
                     recovery_kind = kind
 
@@ -990,7 +1008,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
 
         next_run_dt = _ensure_aware(datetime.fromisoformat(next_run))
         if next_run_dt <= now:
-            schedule = job.get("schedule", {})
+            schedule = _resolve_job_schedule(job) or {}
             kind = schedule.get("kind")
 
             # For recurring jobs, check if the scheduled time is stale

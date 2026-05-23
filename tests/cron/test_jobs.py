@@ -24,7 +24,66 @@ from cron.jobs import (
     advance_next_run,
     get_due_jobs,
     save_job_output,
+    _resolve_job_schedule,
 )
+
+
+# =========================================================================
+# _resolve_job_schedule - schedule field guard
+# =========================================================================
+
+class TestResolveJobSchedule:
+    """Tests for _resolve_job_schedule - guards against 'str' object has no attribute 'get'."""
+
+    def test_full_schedule(self):
+        job = {
+            "schedule": {
+                "kind": "cron",
+                "expr": "0 9 * * *",
+                "display": "Daily at 9am",
+            }
+        }
+        result = _resolve_job_schedule(job)
+        assert isinstance(result, dict)
+        assert result == job["schedule"]
+        assert result["kind"] == "cron"
+        assert result["expr"] == "0 9 * * *"
+
+    def test_no_schedule(self):
+        assert _resolve_job_schedule({}) is None
+        assert _resolve_job_schedule({"schedule": None}) is None
+
+    def test_missing_kind(self):
+        job = {"schedule": {"expr": "0 9 * *"}}
+        result = _resolve_job_schedule(job)
+        assert isinstance(result, dict)
+        assert result.get("kind") is None
+
+    def test_empty_schedule(self):
+        job = {"schedule": {}}
+        result = _resolve_job_schedule(job)
+        assert isinstance(result, dict)
+        assert result == {}
+
+    @pytest.mark.parametrize(
+        "non_dict_schedule",
+        [
+            "0 9 * * *",
+            "cron:0 9 * * *",
+            123,
+            ["cron", "0 9 * * *"],
+            ("cron", "0 9 * * *"),
+            42.0,
+        ],
+    )
+    def test_non_dict_schedule_returns_none_instead_of_crashing(self, non_dict_schedule):
+        """Non-dict schedules (legacy string expressions from hand-edited or
+        migrated jobs.json) must be treated as missing instead of crashing
+        the scheduler tick on ``schedule.get('kind')`` with
+        ``'str' object has no attribute 'get'``.
+        """
+        job = {"schedule": non_dict_schedule}
+        assert _resolve_job_schedule(job) is None
 
 
 # =========================================================================

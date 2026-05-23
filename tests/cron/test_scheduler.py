@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt
+from cron.scheduler import _resolve_origin, _resolve_schedule, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -68,6 +68,64 @@ class TestResolveOrigin:
         """
         job = {"origin": non_dict_origin}
         assert _resolve_origin(job) is None
+
+
+class TestResolveSchedule:
+    """Tests for _resolve_schedule - guards against 'str' object has no attribute 'get'."""
+
+    def test_full_schedule(self):
+        job = {
+            "schedule": {
+                "kind": "cron",
+                "expr": "0 9 * * *",
+                "display": "Daily at 9am",
+            }
+        }
+        result = _resolve_schedule(job)
+        assert isinstance(result, dict)
+        assert result == job["schedule"]
+        assert result["kind"] == "cron"
+        assert result["expr"] == "0 9 * * *"
+
+    def test_no_schedule(self):
+        assert _resolve_schedule({}) is None
+        assert _resolve_schedule({"schedule": None}) is None
+
+    def test_missing_kind(self):
+        job = {"schedule": {"expr": "0 9 * * *"}}
+        result = _resolve_schedule(job)
+        assert isinstance(result, dict)
+        assert result.get("kind") is None
+
+    def test_empty_schedule(self):
+        job = {"schedule": {}}
+        result = _resolve_schedule(job)
+        assert isinstance(result, dict)
+        assert result == {}
+
+    @pytest.mark.parametrize(
+        "non_dict_schedule",
+        [
+            "0 9 * * *",
+            "cron:0 9 * * *",
+            123,
+            ["cron", "0 9 * * *"],
+            ("cron", "0 9 * * *"),
+            42.0,
+        ],
+    )
+    def test_non_dict_schedule_returns_none_instead_of_crashing(self, non_dict_schedule):
+        """Non-dict schedules (legacy string expressions from hand-edited or
+        migrated jobs.json) must be treated as missing instead of crashing
+        the scheduler tick on ``schedule.get('kind')`` with
+        ``'str' object has no attribute 'get'``.
+
+        This mirrors the protection that _resolve_origin provides for the
+        origin field. Jobs created via API/script with malformed schedule
+        fields should not crash the entire tick.
+        """
+        job = {"schedule": non_dict_schedule}
+        assert _resolve_schedule(job) is None
 
 
 class TestResolveDeliveryTarget:
