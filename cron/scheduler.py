@@ -31,7 +31,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -44,6 +44,241 @@ from hermes_cli.config import load_config, _expand_env_vars
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
+
+
+# Known authentication error patterns for provider fallback detection
+_AUTH_ERROR_PATTERNS = [
+    "401",
+    "403",
+    "authentication_error",
+    "authentication failed",
+    "auth failed",
+    "invalid api key",
+    "api key",
+    "unauthorized",
+    "credential",
+    "authentication required",
+    "access denied",
+    "invalid credentials",
+    "token expired",
+    "expired token",
+]
+
+
+def _is_auth_error(error_message: str) -> bool:
+    """Check if an error message indicates an authentication failure.
+
+    Returns True if the error is likely an auth failure (401/403) that
+    could be resolved by trying a different provider.
+    """
+    if not error_message:
+        return False
+    error_lower = error_message.lower()
+    return any(pattern.lower() in error_lower for pattern in _AUTH_ERROR_PATTERNS)
+
+
+def _get_available_providers(exclude_provider: Optional[str] = None) -> List[str]:
+    """Get a list of available providers in the current profile.
+
+    Checks which providers have valid API keys configured. Returns
+    a list of provider names that can be used as fallback.
+    """
+    from hermes_cli.providers import HERMES_OVERLAYS, get_provider
+
+    available = []
+    # Check common providers known to have valid API key patterns
+    # Priority order: openrouter (aggregator), anthropic, openai, then other common ones
+    priority_providers = [
+        "openrouter",
+        "anthropic",
+        "deepseek",
+        "openai",
+        "zai",
+        "xai",
+        "google-gemini-cli",
+        "ollama-cloud",
+    ]
+
+    for provider in priority_providers:
+        if exclude_provider and provider.lower() == exclude_provider.lower():
+            continue
+        try:
+            pdef = get_provider(provider)
+            if pdef and pdef.api_key_env_vars:
+                # Check if any of the env vars are set
+                for env_var in pdef.api_key_env_vars:
+                    if os.getenv(env_var):
+                        available.append(provider)
+                        break
+        except Exception:
+            pass
+
+    return available
+
+
+def _try_fallback_provider(
+    job_id: str,
+    job: dict,
+    model: str,
+    _cfg: dict,
+    _job_workdir: Optional[str],
+    _cron_session_id: str,
+    _session_db: Any,
+    max_iterations: int,
+    reasoning_config: Any,
+    prefill_messages: Any,
+    enabled_toolsets: Any,
+    error_message: str,
+) -> Optional[tuple]:
+    """Try to run the job with a different provider when auth fails.
+
+    Returns (success, output, final_response, error) tuple if a fallback
+    provider works, or None if no fallback could be attempted.
+    """
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from run_agent import AIAgent
+
+    job_name = job.get("name") or job.get("prompt") or job_id or "cron job"
+
+    # Get list of available providers to try as fallback
+    current_provider = job.get("provider") or ""
+    available_providers = _get_available_providers(exclude_provider=current_provider)
+
+    if not available_providers:
+        logger.warning(
+            "Job '%s': auth error but no alternative providers available",
+            job_id,
+        )
+        return None
+
+    logger.info(
+        "Job '%s': auth error detected, trying fallback providers: %s",
+        job_id,
+        available_providers,
+    )
+
+    for fallback_provider in available_providers:
+        try:
+            logger.info(
+                "Job '%s': attempting fallback to provider %s",
+                job_id,
+                fallback_provider,
+            )
+
+            runtime = resolve_runtime_provider(requested=fallback_provider)
+
+            # Build credential pool for the fallback provider
+            credential_pool = None
+            runtime_provider = str(runtime.get("provider") or "").strip().lower()
+            if runtime_provider:
+                try:
+                    from agent.credential_pool import load_pool
+                    pool = load_pool(runtime_provider)
+                    if pool.has_credentials():
+                        credential_pool = pool
+                except Exception:
+                    pass
+
+            # Create agent with fallback provider
+            fallback_model = _cfg.get("fallback_providers") or _cfg.get("fallback_model") or None
+            pr = _cfg.get("provider_routing", {})
+
+            agent = AIAgent(
+                model=model,
+                api_key=runtime.get("api_key"),
+                base_url=runtime.get("base_url"),
+                provider=runtime.get("provider"),
+                api_mode=runtime.get("api_mode"),
+                acp_command=runtime.get("command"),
+                acp_args=runtime.get("args"),
+                max_iterations=max_iterations,
+                reasoning_config=reasoning_config,
+                prefill_messages=prefill_messages,
+                fallback_model=fallback_model,
+                credential_pool=credential_pool,
+                providers_allowed=pr.get("only"),
+                providers_ignored=pr.get("ignore"),
+                providers_order=pr.get("order"),
+                provider_sort=pr.get("sort"),
+                openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=["cronjob", "messaging", "clarify"],
+                quiet_mode=True,
+                skip_context_files=not bool(_job_workdir),
+                load_soul_identity=True,
+                skip_memory=True,
+                platform="cron",
+                session_id=_cron_session_id,
+                session_db=_session_db,
+            )
+
+            # Get prompt - need to rebuild it
+            from cron.scheduler import _build_job_prompt
+            prompt = _build_job_prompt(job)
+
+            if prompt is None:
+                logger.info("Job '%s': script produced no output with fallback provider, skipping", job_name)
+                return True, "", "[SILENT]", None
+
+            # Run with timeout
+            _cron_timeout = 600.0
+            _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            _cron_context = contextvars.copy_context()
+            _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+
+            try:
+                result = _cron_future.result(timeout=_cron_timeout)
+            finally:
+                _cron_pool.shutdown(wait=False, cancel_futures=True)
+
+            if not isinstance(result, dict):
+                raise RuntimeError(f"agent.run_conversation returned {type(result).__name__} instead of dict")
+
+            if result.get("failed") is True or result.get("completed") is False:
+                _err = result.get("error") or result.get("final_response", "").strip() or "agent reported failure"
+                raise RuntimeError(_err)
+
+            final_response = result.get("final_response", "") or ""
+            if final_response.strip() == "(No response generated)":
+                final_response = ""
+
+            output = f"""# Cron Job: {job_name}
+
+**Job ID:** {job_id}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Schedule:** {job.get('schedule_display', 'N/A')}
+**Provider:** {fallback_provider} (fallback after auth error)
+
+## Prompt
+
+{prompt}
+
+## Response
+
+{final_response if final_response else "(No response generated)"}
+"""
+
+            logger.info(
+                "Job '%s' completed successfully with fallback provider %s",
+                job_name,
+                fallback_provider,
+            )
+            return True, output, final_response, None
+
+        except Exception as fb_exc:
+            logger.warning(
+                "Job '%s': fallback provider %s failed: %s",
+                job_id,
+                fallback_provider,
+                fb_exc,
+            )
+            continue
+
+    logger.error(
+        "Job '%s': all fallback providers exhausted, job failed",
+        job_id,
+    )
+    return None
 
 
 class CronPromptInjectionBlocked(Exception):
@@ -1940,7 +2175,34 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
-        
+
+        # Check if this is an authentication error that might be resolved by trying
+        # a different provider. Only try fallback once to avoid infinite loops.
+        is_auth_err = _is_auth_error(error_msg)
+        if is_auth_err:
+            # Try fallback providers for auth errors
+            logger.info("Job '%s': attempting provider fallback after auth error", job_id)
+            _enabled_toolsets = _resolve_cron_enabled_toolsets(job, _cfg) if job else None
+            fb_result = _try_fallback_provider(
+                job_id=job_id,
+                job=job,
+                model=model,
+                _cfg=_cfg,
+                _job_workdir=_job_workdir,
+                _cron_session_id=_cron_session_id,
+                _session_db=_session_db,
+                max_iterations=max_iterations,
+                reasoning_config=reasoning_config,
+                prefill_messages=prefill_messages,
+                enabled_toolsets=_enabled_toolsets,
+                error_message=error_msg,
+            )
+            if fb_result is not None:
+                # Fallback succeeded - return the result instead of failure
+                logger.info("Job '%s': fallback provider succeeded", job_id)
+                return fb_result
+            # Fallback exhausted - continue to return failure
+
         output = f"""# Cron Job: {job_name} (FAILED)
 
 **Job ID:** {job_id}
