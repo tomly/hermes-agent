@@ -139,11 +139,21 @@ def _resolve_base_dir(task_id: str = "default") -> Path:
         base = Path(live).expanduser()
     else:
         raw = os.environ.get("TERMINAL_CWD")
-        base = Path(raw).expanduser() if raw else Path(os.getcwd())
+        try:
+            cwd = os.getcwd()
+        except FileNotFoundError:
+            # Process CWD doesn't exist (e.g., workspace dir was deleted).
+            # Fall back to home directory to avoid FileNotFoundError.
+            cwd = os.path.expanduser("~")
+        base = Path(raw).expanduser() if raw else Path(cwd)
     if not base.is_absolute():
         # A relative base (".", "./sub", "..") is anchored to the process cwd
         # once, here, so the result no longer depends on cwd at resolve() time.
-        base = Path(os.getcwd()) / base
+        try:
+            cwd = os.getcwd()
+        except FileNotFoundError:
+            cwd = os.path.expanduser("~")
+        base = Path(cwd) / base
     return base.resolve()
 
 

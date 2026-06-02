@@ -75,6 +75,18 @@ WATCH_GLOBAL_WINDOW_SECONDS = 10
 WATCH_GLOBAL_COOLDOWN_SECONDS = 30
 
 
+def _get_cwd_safe() -> str:
+    """Get current working directory safely, falling back to home if it doesn't exist.
+
+    This handles the case where the process's CWD was deleted (e.g., workspace dir
+    was removed), which would cause os.getcwd() to raise FileNotFoundError.
+    """
+    try:
+        return os.getcwd()
+    except FileNotFoundError:
+        return os.path.expanduser("~")
+
+
 def format_uptime_short(seconds: int) -> str:
     s = max(0, int(seconds))
     if s < 60:
@@ -536,7 +548,7 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
-            cwd=_resolve_safe_cwd(cwd or os.getcwd()),
+            cwd=_resolve_safe_cwd(cwd or _get_cwd_safe()),
             started_at=time.time(),
         )
 

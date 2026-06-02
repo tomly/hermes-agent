@@ -445,7 +445,14 @@ class LocalEnvironment(BaseEnvironment):
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         if cwd:
             cwd = os.path.expanduser(cwd)
-        super().__init__(cwd=cwd or os.getcwd(), timeout=timeout, env=env)
+        if not cwd:
+            try:
+                cwd = os.getcwd()
+            except FileNotFoundError:
+                # Process CWD doesn't exist (e.g., workspace dir was deleted).
+                # Fall back to home directory to avoid FileNotFoundError.
+                cwd = os.path.expanduser("~")
+        super().__init__(cwd=cwd, timeout=timeout, env=env)
         self.init_session()
 
     def get_temp_dir(self) -> str:

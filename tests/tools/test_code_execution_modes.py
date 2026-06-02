@@ -220,6 +220,36 @@ class TestResolveChildCwd(unittest.TestCase):
         with patch.dict(os.environ, {"TERMINAL_CWD": "~"}):
             self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), home)
 
+    def test_project_getcwd_file_not_found_falls_back_to_home(self):
+        """Test that FileNotFoundError from os.getcwd() falls back to home directory."""
+        import pathlib
+        home = str(pathlib.Path.home())
+
+        # Simulate a missing CWD by patching os.getcwd to raise FileNotFoundError
+        original_getcwd = os.getcwd
+        def fake_getcwd():
+            raise FileNotFoundError("current working directory does not exist")
+
+        with patch.dict(os.environ, {k: v for k, v in os.environ.items() if k != "TERMINAL_CWD"}, clear=True):
+            with patch("os.getcwd", fake_getcwd):
+                result = _resolve_child_cwd("project", "/tmp/staging")
+                self.assertEqual(result, home)
+
+    def test_project_terminal_cwd_not_exist_uses_getcwd_or_home(self):
+        """Test that non-existent TERMINAL_CWD falls back to getcwd or home."""
+        import pathlib
+        home = str(pathlib.Path.home())
+        original_getcwd = os.getcwd
+        def fake_getcwd():
+            raise FileNotFoundError("current working directory does not exist")
+
+        # When TERMINAL_CWD is set to a non-existent path AND getcwd fails,
+        # should fall back to home
+        with patch.dict(os.environ, {"TERMINAL_CWD": "/does/not/exist"}):
+            with patch("os.getcwd", fake_getcwd):
+                result = _resolve_child_cwd("project", "/tmp/staging")
+                self.assertEqual(result, home)
+
 
 # ---------------------------------------------------------------------------
 # Schema description
