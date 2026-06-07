@@ -84,7 +84,15 @@ def cron_list(show_all: bool = False):
         # `repeat` may be present-but-null in the job record (e.g. a one-shot
         # job persisted with "repeat": null), so coalesce to {} rather than
         # relying on the dict-default, which only applies to a missing key.
-        repeat_info = job.get("repeat") or {}
+        # Also handle legacy string values like "forever" / "infinite".
+        repeat_raw = job.get("repeat") or {}
+        if isinstance(repeat_raw, dict):
+            repeat_info = repeat_raw
+        elif isinstance(repeat_raw, str):
+            # Legacy / hand-edited repeat values like "forever" or "infinite"
+            repeat_info = {"times": None, "completed": 0}
+        else:
+            repeat_info = {}
         repeat_times = repeat_info.get("times")
         repeat_completed = repeat_info.get("completed", 0)
         repeat_str = f"{repeat_completed}/{repeat_times}" if repeat_times else "∞"

@@ -153,6 +153,12 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     profile = _coerce_job_text(normalized.get("profile")).strip()
     normalized["profile"] = profile or None
 
+    repeat_raw = normalized.get("repeat")
+    if isinstance(repeat_raw, str):
+        normalized["repeat"] = {"times": None, "completed": 0}
+    elif repeat_raw is None:
+        normalized["repeat"] = {}
+
     return normalized
 
 
