@@ -200,3 +200,112 @@ class TestTryFallbackProviderFunction:
         # This test verifies the function has proper structure
         # The actual execution would require more complex mocking
         assert callable(sched._try_fallback_provider)
+
+
+class TestIsPseudoFailure:
+    """Test the _is_pseudo_failure function that detects false failures with valid report content."""
+
+    def test_recognizes_runtime_error_with_chinese_header(self):
+        """Chinese markdown headers in error message indicate valid report content."""
+        from cron.scheduler import _is_pseudo_failure
+
+        error_msg = "RuntimeError: # 投资日报\n\n## 今日操作\n买入..."
+        assert _is_pseudo_failure(error_msg) is True
+
+    def test_recognizes_runtime_error_with_reflection_header(self):
+        """Reflection headers indicate valid report content."""
+        from cron.scheduler import _is_pseudo_failure
+
+        error_msg = "RuntimeError: ## 每日反思\n\n今天..."
+        assert _is_pseudo_failure(error_msg) is True
+
+    def test_recognizes_runtime_error_with_english_header(self):
+        """English markdown headers indicate valid report content."""
+        from cron.scheduler import _is_pseudo_failure
+
+        error_msg = "RuntimeError: # Daily Report\n\n## Market Review\n..."
+        assert _is_pseudo_failure(error_msg) is True
+
+    def test_recognizes_investment_report_keywords(self):
+        """Chinese investment report keywords indicate valid content."""
+        from cron.scheduler import _is_pseudo_failure
+
+        keywords = [
+            "RuntimeError: 投资日报",
+            "RuntimeError: 每日反思",
+            "RuntimeError: 交易记录",
+            "RuntimeError: 持仓分析",
+            "RuntimeError: 收益总结",
+            "RuntimeError: 市场回顾",
+            "RuntimeError: 操作计划",
+        ]
+        for msg in keywords:
+            assert _is_pseudo_failure(msg) is True, f"Failed for: {msg}"
+
+    def test_recognizes_english_investment_keywords(self):
+        """English investment report keywords indicate valid content."""
+        from cron.scheduler import _is_pseudo_failure
+
+        keywords = [
+            "RuntimeError: Daily Report",
+            "RuntimeError: Daily Reflection",
+            "RuntimeError: Investment Report",
+            "RuntimeError: Trading Record",
+            "RuntimeError: Portfolio Analysis",
+        ]
+        for msg in keywords:
+            assert _is_pseudo_failure(msg) is True, f"Failed for: {msg}"
+
+    def test_rejects_real_runtime_errors(self):
+        """Real errors without report content should return False."""
+        from cron.scheduler import _is_pseudo_failure
+
+        real_errors = [
+            "RuntimeError: 401 unauthorized",
+            "RuntimeError: connection timeout",
+            "RuntimeError: API key invalid",
+            "RuntimeError: rate limit exceeded",
+            "RuntimeError: model not found",
+        ]
+        for msg in real_errors:
+            assert _is_pseudo_failure(msg) is False, f"Failed for: {msg}"
+
+    def test_rejects_non_runtime_errors(self):
+        """Non-RuntimeError exceptions should return False."""
+        from cron.scheduler import _is_pseudo_failure
+
+        other_errors = [
+            "TimeoutError: job timed out",
+            "ValueError: invalid parameter",
+            "ConnectionError: network failure",
+        ]
+        for msg in other_errors:
+            assert _is_pseudo_failure(msg) is False, f"Failed for: {msg}"
+
+    def test_handles_agent_reported_failure_without_content(self):
+        """'agent reported failure' without content should return False."""
+        from cron.scheduler import _is_pseudo_failure
+
+        assert _is_pseudo_failure("agent reported failure") is False
+        assert _is_pseudo_failure("RuntimeError: agent reported failure") is False
+
+    def test_handles_empty_and_none(self):
+        """Empty or None inputs should return False."""
+        from cron.scheduler import _is_pseudo_failure
+
+        assert _is_pseudo_failure("") is False
+        assert _is_pseudo_failure(None) is False
+
+    def test_case_insensitive_for_keywords(self):
+        """Keyword matching should be case insensitive."""
+        from cron.scheduler import _is_pseudo_failure
+
+        assert _is_pseudo_failure("RuntimeError: 投资日报") is True
+        assert _is_pseudo_failure("RuntimeError: INVESTMENT REPORT") is True
+
+    def test_accepts_plain_markdown_header(self):
+        """Plain markdown header starting the error should indicate valid content."""
+        from cron.scheduler import _is_pseudo_failure
+
+        assert _is_pseudo_failure("RuntimeError: # Overview") is True
+        assert _is_pseudo_failure("RuntimeError: ## Summary") is True

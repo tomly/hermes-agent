@@ -15,6 +15,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -75,6 +76,61 @@ def _is_auth_error(error_message: str) -> bool:
         return False
     error_lower = error_message.lower()
     return any(pattern.lower() in error_lower for pattern in _AUTH_ERROR_PATTERNS)
+
+
+# Patterns indicating the "error" is actually valid report content
+_PSEUDO_FAILURE_PATTERNS = [
+    # Markdown headers indicate structured report content
+    r'^#{1,6}\s+\S',  # Markdown headers like "# 投资日报" or "## 反思"
+    # Investment report keywords
+    r'投资日报',
+    r'每日反思',
+    r'交易记录',
+    r'持仓分析',
+    r'收益总结',
+    r'市场回顾',
+    r'操作计划',
+    # English equivalents
+    r'Daily Report',
+    r'Daily Reflection',
+    r'Investment Report',
+    r'Trading Record',
+    r'Portfolio Analysis',
+]
+
+
+def _is_pseudo_failure(error_message: str, final_response: str = "") -> bool:
+    """Check if a RuntimeError is actually a valid report (pseudo-failure).
+
+    Sometimes the agent returns completed=False but the final_response
+    contains valid report content. The scheduler incorrectly raises
+    RuntimeError with the report text as the error message. Detect this
+    pattern and treat it as success instead of failure.
+
+    Returns True if the "error" message appears to be actual report content.
+    """
+    if not error_message:
+        return False
+
+    # Must be a RuntimeError to be considered a pseudo-failure
+    if not ("RuntimeError" in error_message or error_message.startswith("agent reported failure")):
+        return False
+
+    # Check if error message contains report-like content
+    # Extract just the message part after "RuntimeError: "
+    error_content = error_message
+    if "RuntimeError: " in error_message:
+        error_content = error_message.split("RuntimeError: ", 1)[1]
+
+    for pattern in _PSEUDO_FAILURE_PATTERNS:
+        if re.search(pattern, error_content, re.IGNORECASE):
+            return True
+
+    # Also check if error content starts with markdown header
+    if error_content.strip().startswith("#"):
+        return True
+
+    return False
 
 
 def _get_available_providers(exclude_provider: Optional[str] = None) -> List[str]:
@@ -2175,6 +2231,36 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
+
+        # Check if this is a "pseudo-failure" — the agent returned valid report
+        # content but was incorrectly marked as failed. In this case, treat it
+        # as success and deliver the report content normally.
+        if _is_pseudo_failure(error_msg):
+            # Extract the actual report content from the error message
+            report_content = error_msg
+            if "RuntimeError: " in error_msg:
+                report_content = error_msg.split("RuntimeError: ", 1)[1]
+
+            logger.info(
+                "Job '%s': detected pseudo-failure with valid report content, "
+                "converting to success",
+                job_name,
+            )
+            output = f"""# Cron Job: {job_name}
+
+**Job ID:** {job_id}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Schedule:** {job.get('schedule_display', 'N/A')}
+
+## Prompt
+
+{prompt}
+
+## Response
+
+{report_content}
+"""
+            return True, output, report_content, None
 
         # Check if this is an authentication error that might be resolved by trying
         # a different provider. Only try fallback once to avoid infinite loops.
