@@ -2444,3 +2444,116 @@ class TestSendMediaTimeoutCancelsFuture:
         # 2. Second file still got dispatched — one timeout doesn't abort the batch
         adapter.send_video.assert_called_once()
         assert adapter.send_video.call_args[1]["video_path"] == "/tmp/fast.mp4"
+
+
+class TestReloadStaleModules:
+    """Tests for _reload_stale_modules — ensures cron picks up code updates after git pull."""
+
+    def test_first_run_returns_false_without_reload(self):
+        """On first invocation, should not reload and should return False."""
+        from cron import scheduler
+
+        # Save original global state
+        original_last_rev = scheduler._last_git_revision
+
+        try:
+            # Reset to ensure first run behavior
+            scheduler._last_git_revision = None
+
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stdout="abc123\n")
+                result = scheduler._reload_stale_modules()
+
+                # First run should initialize revision but not reload
+                assert result is False
+                assert scheduler._last_git_revision == "abc123"
+        finally:
+            scheduler._last_git_revision = original_last_rev
+
+    def test_no_change_returns_false(self):
+        """When git revision hasn't changed, should not reload."""
+        from cron import scheduler
+
+        original_last_rev = scheduler._last_git_revision
+
+        try:
+            # Set known revision
+            scheduler._last_git_revision = "abc123"
+
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stdout="abc123\n")
+                result = scheduler._reload_stale_modules()
+
+                assert result is False
+                # Revision should remain unchanged
+                assert scheduler._last_git_revision == "abc123"
+        finally:
+            scheduler._last_git_revision = original_last_rev
+
+    def test_revision_change_triggers_reload(self):
+        """When git revision changes, should reload modules."""
+        from cron import scheduler
+
+        original_last_rev = scheduler._last_git_revision
+
+        try:
+            # Set known revision
+            scheduler._last_git_revision = "oldrev"
+
+            # Mock sys.modules to simulate loaded modules
+            mock_utils = MagicMock()
+            mock_hermes_constants = MagicMock()
+
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stdout="newrev\n")
+
+                with patch("sys.modules", {"utils": mock_utils, "hermes_constants": mock_hermes_constants}):
+                    with patch("importlib.reload") as mock_reload:
+                        result = scheduler._reload_stale_modules()
+
+                        assert result is True
+                        assert scheduler._last_git_revision == "newrev"
+                        # Should have attempted to reload the modules
+                        assert mock_reload.call_count >= 1
+        finally:
+            scheduler._last_git_revision = original_last_rev
+
+    def test_non_git_directory_returns_false(self):
+        """When not in a git repo, should return False without error."""
+        from cron import scheduler
+
+        original_last_rev = scheduler._last_git_revision
+
+        try:
+            scheduler._last_git_revision = None
+
+            with patch("pathlib.Path.resolve") as mock_resolve:
+                mock_resolve.return_value.parent.parent / ".git"
+
+                # Path doesn't exist - simulate no .git directory
+                with patch("pathlib.Path.__truediv__", side_effect=FileNotFoundError):
+                    result = scheduler._reload_stale_modules()
+
+                # Should gracefully handle and return False
+                assert result is False
+        finally:
+            scheduler._last_git_revision = original_last_rev
+
+    def test_git_command_failure_returns_false(self):
+        """When git rev-parse fails, should return False gracefully."""
+        from cron import scheduler
+
+        original_last_rev = scheduler._last_git_revision
+
+        try:
+            scheduler._last_git_revision = "abc123"
+
+            with patch("subprocess.run") as mock_run:
+                # Git command fails
+                mock_run.return_value = MagicMock(returncode=128, stdout="", stderr="not a git repo")
+
+                result = scheduler._reload_stale_modules()
+
+                assert result is False
+        finally:
+            scheduler._last_git_revision = original_last_rev

@@ -145,6 +145,87 @@ def _get_lock_paths() -> tuple[Path, Path]:
     return lock_dir, lock_dir / ".tick.lock"
 
 
+# Track last known git revision to detect code updates via git pull.
+_last_git_revision: Optional[str] = None
+
+
+def _reload_stale_modules() -> bool:
+    """Check if code has been updated (git pull) and reload stale modules.
+
+    This solves the issue where running gateway processes don't pick up
+    code changes from auto-update (git pull). Without this, cron jobs fail
+    with ImportError when importing functions that were added/removed in
+    the new code.
+
+    Returns True if modules were reloaded, False otherwise.
+    """
+    global _last_git_revision
+
+    try:
+        import subprocess
+
+        # Find the hermes-agent repo directory
+        repo_dir = Path(__file__).parent.parent.resolve()
+        if not (repo_dir / ".git").exists():
+            return False
+
+        # Get current git revision (short hash)
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=str(repo_dir),
+        )
+        if result.returncode != 0:
+            return False
+
+        current_rev = result.stdout.strip()
+        if not current_rev:
+            return False
+
+        # First run — initialize without reload
+        if _last_git_revision is None:
+            _last_git_revision = current_rev
+            return False
+
+        # No change — nothing to do
+        if current_rev == _last_git_revision:
+            return False
+
+        # Code has been updated! Reload commonly-used modules that might have
+        # changed. Focus on modules imported by cron scheduler and its
+        # dependencies that commonly cause ImportError.
+        modules_to_reload = [
+            "utils",
+            "hermes_constants",
+            "hermes_cli.config",
+            "hermes_time",
+            "cron.jobs",
+        ]
+
+        reloaded = []
+        import importlib
+
+        for mod_name in modules_to_reload:
+            try:
+                mod = sys.modules.get(mod_name)
+                if mod is not None:
+                    importlib.reload(mod)
+                    reloaded.append(mod_name)
+            except Exception:
+                pass  # Non-fatal — module might not be loaded or reload might fail
+
+        if reloaded:
+            logger.info("Code updated (git revision changed), reloaded %d stale module(s): %s", len(reloaded), ", ".join(reloaded))
+
+        _last_git_revision = current_rev
+        return bool(reloaded)
+
+    except Exception:
+        return False
+
+
 def _resolve_origin(job: dict) -> Optional[dict]:
     """Extract origin info from a job, preserving any extra routing metadata.
 
@@ -1027,10 +1108,14 @@ def _scan_assembled_cron_prompt(assembled: str, job: dict) -> str:
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
-    
+
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
     """
+    # Ensure stale modules are reloaded before running a job.
+    # This handles direct run_job calls that bypass tick().
+    _reload_stale_modules()
+
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
@@ -1672,18 +1757,23 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     """
     Check and run all due jobs.
-    
+
     Uses a file lock so only one tick runs at a time, even if the gateway's
     in-process ticker and a standalone daemon or manual tick overlap.
-    
+
     Args:
         verbose: Whether to print status messages
         adapters: Optional dict mapping Platform → live adapter (from gateway)
         loop: Optional asyncio event loop (from gateway) for live adapter sends
-    
+
     Returns:
         Number of jobs executed (0 if another tick is already running)
     """
+    # Check if code has been updated (via git pull) and reload stale modules.
+    # This ensures cron jobs can import functions that were added/removed in
+    # new code without requiring gateway restart.
+    _reload_stale_modules()
+
     lock_dir, lock_file = _get_lock_paths()
     lock_dir.mkdir(parents=True, exist_ok=True)
 
