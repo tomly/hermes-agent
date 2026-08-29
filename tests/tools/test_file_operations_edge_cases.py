@@ -75,6 +75,53 @@ class TestIsLikelyBinary:
         sample = "\x00" * 200 + "a" * 800 + "\x00" * 1000
         assert ops._is_likely_binary("file.xyz", content_sample=sample) is False
 
+    # ------------------------------------------------------------------
+    # U+FFFD truncation-artifact handling (Bug 1002)
+    # ------------------------------------------------------------------
+
+    def test_trailing_replacement_char_is_truncation_artifact(self, ops):
+        """A U+FFFD from ``head -c N`` cutting mid multi-byte char must NOT
+        classify a UTF-8 text file as binary."""
+        # 333 complete 3-byte chars (999 bytes) + 1 dangling lead byte →
+        # exactly one phantom U+FFFD at the end of the 1000-byte sample.
+        sample = "研" * 333 + "\ufffd"
+        assert ops._is_likely_binary("index.md", content_sample=sample) is False
+
+    def test_trailing_replacement_char_before_newline_not_binary(self, ops):
+        """A phantom U+FFFD followed by the newline the cut left behind is
+        still a truncation artifact, not a binary signal."""
+        sample = "研" * 333 + "\ufffd\n"
+        assert ops._is_likely_binary("index.md", content_sample=sample) is False
+
+    def test_interior_replacement_char_still_binary(self, ops):
+        """A genuine U+FFFD in the middle of the sample (real non-UTF-8 bytes
+        scattered through the file) is still treated as binary."""
+        sample = "ok" + "\ufffd" + "text"
+        assert ops._is_likely_binary("data.xyz", content_sample=sample) is True
+
+    # ------------------------------------------------------------------
+    # Byte-domain analysis (raw on-disk bytes, authoritative when present)
+    # ------------------------------------------------------------------
+
+    def test_byte_stats_utf8_multibyte_text_is_not_binary(self, ops):
+        """Byte stats for UTF-8 text (incl. multi-byte chars) must not classify
+        as binary — continuation bytes are all >= 0x80, so neither NUL nor
+        control bytes appear."""
+        assert ops._is_likely_binary(
+            "index.md", byte_stats=(1000, 0, 0)) is False
+
+    def test_byte_stats_nul_byte_is_binary(self, ops):
+        assert ops._is_likely_binary("data.xyz", byte_stats=(1000, 5, 0)) is True
+
+    def test_byte_stats_high_control_density_is_binary(self, ops):
+        # 301 control bytes / 1000 = 30.1% > 30% → binary
+        assert ops._is_likely_binary("data.xyz", byte_stats=(1000, 0, 301)) is True
+
+    def test_byte_stats_below_control_threshold_is_text(self, ops):
+        # 299 control bytes / 1000 = 29.9% <= 30% → text
+        assert ops._is_likely_binary("data.xyz", byte_stats=(1000, 0, 299)) is False
+
+
 
 # =========================================================================
 # _check_lint edge cases

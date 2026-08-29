@@ -194,6 +194,67 @@ def file_ops(mock_env):
     return ShellFileOperations(mock_env)
 
 
+def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMock:
+    """Mock env whose execute() runs the command in a real subprocess.
+
+    For tests that need the generated shell scripts to actually run
+    (search fallback, atomic-write permissions) instead of being
+    intercepted by a bare MagicMock.  ``include_stderr`` folds stderr
+    into ``output`` for tests that surface shell error text; leave it
+    off for tests that parse structured stdout (e.g. find results).
+    """
+    env = MagicMock()
+    env.cwd = cwd
+
+    def execute(command, **kwargs):
+        completed = subprocess.run(
+            command,
+            shell=True,
+            text=True,
+            capture_output=True,
+            input=kwargs.get("stdin_data"),
+        )
+        output = completed.stdout
+        if include_stderr:
+            output += completed.stderr
+        return {
+            "output": output,
+            "returncode": completed.returncode,
+        }
+
+    env.execute = execute
+    return env
+
+
+def make_real_subprocess_env_replace(cwd: str) -> MagicMock:
+    """Real-subprocess mock env that decodes stdout with ``errors="replace"``.
+
+    Mirrors the real terminal backend (which decodes tool output with
+    errors="replace"). Needed to exercise the truncated-mid-char sample path
+    that ``head -c 1000`` produces on a multi-byte UTF-8 file — a strict
+    decode would raise instead of yielding the phantom U+FFFD the real
+    backend would have produced.
+    """
+    env = MagicMock()
+    env.cwd = cwd
+
+    def execute(command, **kwargs):
+        completed = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            input=kwargs.get("stdin_data"),
+        )
+        output = completed.stdout.decode("utf-8", errors="replace")
+        return {
+            "output": output,
+            "returncode": completed.returncode,
+        }
+
+    env.execute = execute
+    return env
+
+
 class TestShellFileOpsHelpers:
     def test_normalize_read_pagination_clamps_invalid_values(self):
         assert normalize_read_pagination(offset=0, limit=0) == (1, 1)
@@ -214,6 +275,46 @@ class TestShellFileOpsHelpers:
         assert "'" in result
         # Should be safely escaped
         assert result.count("'") >= 4  # wrapping + escaping
+
+    def test_escape_shell_arg_rewrites_forward_slash_native_paths(self, monkeypatch, file_ops):
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert file_ops._escape_shell_arg(
+            "C:/Users/alice/notes.txt"
+        ) == "'/c/Users/alice/notes.txt'"
+
+    def test_read_file_uses_bash_safe_windows_paths(self, mock_env, monkeypatch):
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        commands = []
+
+        def side_effect(command, **kwargs):
+            commands.append(command)
+            if command.startswith("wc -c"):
+                return {"output": "5\n", "returncode": 0}
+            if command.startswith("head -c"):
+                return {"output": "hello", "returncode": 0}
+            if command.startswith("sed -n"):
+                return {"output": "hello\n", "returncode": 0}
+            if command.startswith("wc -l"):
+                return {"output": "1\n", "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        result = ops.read_file(r"C:\Users\alice\notes.txt")
+
+        assert result.error is None
+        assert commands[0] == "wc -c < '/c/Users/alice/notes.txt' 2>/dev/null"
+        # Byte-domain binary probe runs between the size check and the
+        # decoded-text sample (its mock output is empty → probe degrades to
+        # None and the decoded heuristics take over).
+        assert commands[1].startswith("python3 -c ")
+        assert commands[2] == "head -c 1000 '/c/Users/alice/notes.txt' 2>/dev/null"
+        assert commands[3] == "sed -n '1,2000p' '/c/Users/alice/notes.txt'"
+        assert commands[4] == "wc -l < '/c/Users/alice/notes.txt'"
 
     def test_is_likely_binary_by_extension(self, file_ops):
         assert file_ops._is_likely_binary("photo.png") is True
@@ -579,3 +680,170 @@ class TestPatchReplacePostWriteVerification:
         result = ops.patch_replace("/tmp/test/a.py", "hello", "hi")
         assert result.error is not None
         assert "could not re-read" in result.error.lower()
+
+
+
+# =========================================================================
+# Git baseline check for write_file warning
+# =========================================================================
+
+class _DeletedTestGitBaselineCheck:
+    """Removed May 2026 — these tests asserted on a ``_check_git_baseline``
+    method that doesn't exist on ``ShellFileOperations`` (regression intro
+    by a separate refactor). All 6 tests in the class fail with
+    AttributeError on origin/main. Deleted wholesale per Teknium's
+    instruction to keep CI green; reinstate them when the underlying
+    helper is restored or replaced.
+    """
+    pass
+
+
+# =========================================================================
+# Atomic write: umask-default permissions for new files
+# =========================================================================
+
+class TestAtomicWriteNewFilePermissions:
+    """_atomic_write should apply umask-default perms to new files (not 0600)."""
+
+    @pytest.mark.parametrize("test_umask", [0o022, 0o002, 0o077])
+    def test_new_file_gets_umask_default_permissions(self, tmp_path, test_umask):
+        """Newly created file should get umask-computed perms, not mktemp's 0600.
+
+        Uses a real subprocess so the shell script actually runs.
+        """
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        dest = tmp_path / "new_file.txt"
+        assert not dest.exists()
+
+        old_umask = os.umask(test_umask)
+        try:
+            result = ops.write_file(str(dest), "test content\n")
+        finally:
+            os.umask(old_umask)
+
+        assert result.error is None, f"write failed: {result.error}"
+        assert dest.read_text() == "test content\n"
+        expected_mode = 0o666 & ~test_umask
+        actual_mode = dest.stat().st_mode & 0o777
+        assert actual_mode == expected_mode, (
+            f"Expected mode {expected_mode:04o} (umask {test_umask:04o}), "
+            f"got {actual_mode:04o}"
+        )
+
+    def test_overwrite_still_preserves_existing_mode(self, tmp_path):
+        """The new-file branch must not disturb the overwrite path's
+        mode preservation (e.g. an executable script stays 0755)."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        dest = tmp_path / "existing.sh"
+        dest.write_text("#!/bin/sh\n")
+        dest.chmod(0o755)
+
+        result = ops.write_file(str(dest), "#!/bin/sh\necho updated\n")
+
+        assert result.error is None, f"write failed: {result.error}"
+        assert dest.read_text() == "#!/bin/sh\necho updated\n"
+        assert dest.stat().st_mode & 0o777 == 0o755
+
+
+class TestAtomicWriteThroughSymlink:
+    """_atomic_write must edit a symlink's target, not replace the link.
+
+    Regression: the temp-file + ``mv`` swap replaced the symlink itself with a
+    plain file, orphaning the real target and destroying the link (data-loss).
+    """
+
+    def test_write_follows_symlink_and_preserves_link(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        real = tmp_path / "real.txt"
+        link = tmp_path / "link.txt"
+        real.write_text("original\n")
+        link.symlink_to(real)
+
+        result = ops.write_file(str(link), "newcontent\n")
+
+        assert result.error is None, f"write failed: {result.error}"
+        # The link must survive as a symlink...
+        assert link.is_symlink(), "symlink was replaced by a plain file"
+        # ...and the real target must carry the new content.
+        assert real.read_text() == "newcontent\n"
+        assert os.path.realpath(link) == str(real)
+
+    def test_write_through_broken_symlink_falls_back(self, tmp_path):
+        """A broken link resolves through readlink -f and creates the target."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        target = tmp_path / "target.txt"
+        link = tmp_path / "broken.lnk"
+        link.symlink_to(target)  # target does not exist yet
+
+        result = ops.write_file(str(link), "data\n")
+
+        assert result.error is None, f"write failed: {result.error}"
+        assert target.exists()
+        assert target.read_text() == "data\n"
+
+
+class TestReadNonUtf8IsBinary:
+    """Non-UTF-8 content must be flagged binary, not returned as lossy text.
+
+    Regression: the terminal env decodes stdout with errors="replace", turning
+    every non-UTF-8 byte into U+FFFD before _is_likely_binary sees it. U+FFFD is
+    "printable", so the non-printable ratio never caught it, and a
+    read→edit→write round-trip would overwrite the original bytes with mojibake.
+    """
+
+    def test_replacement_char_sample_flagged_binary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # A latin-1 file decoded with errors="replace" yields U+FFFD chars.
+        lossy_sample = "caf\ufffd r\ufffdsum\ufffd\n"
+        assert ops._is_likely_binary("notes.txt", lossy_sample) is True
+
+    def test_plain_utf8_text_not_flagged(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # Proper UTF-8 (including non-ASCII) must still read as text.
+        assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+
+class TestReadTruncatedMultibyteSample:
+    """A 1000-byte read sample that cuts mid multi-byte UTF-8 char must NOT
+    be misjudged as binary.
+
+    Regression (Bug 1002): read_file/read_file_raw sample via ``head -c 1000``;
+    when the cut lands inside a multi-byte char, the terminal env's
+    errors="replace" decode emits one trailing U+FFFD. The old binary check
+    treated any U+FFFD as binary, so a legitimate UTF-8 text file whose 1000th
+    byte split a Chinese char was unreadable (e.g. lessons-learned INDEX.md,
+    unreadable 8/29 + 8/30). The byte-domain probe reads the raw on-disk bytes
+    and counts only NUL / control bytes, so multi-byte UTF-8 can never be
+    misjudged.
+    """
+
+    def _utf8_file_cut_mid_char(self, tmp_path):
+        # 334 Chinese chars = 1002 bytes; head -c 1000 stops on the first byte
+        # of char 334, so the decoded 1000-byte sample ends with one U+FFFD.
+        p = tmp_path / "notes.md"
+        p.write_bytes(("研" * 334 + "\n").encode("utf-8"))
+        return p
+
+    def test_read_file_not_binary_when_sample_cuts_multibyte_char(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env_replace(str(tmp_path)))
+        p = self._utf8_file_cut_mid_char(tmp_path)
+        result = ops.read_file(str(p))
+        assert result.error is None
+        assert result.is_binary is False
+        assert result.content
+
+    def test_read_file_raw_not_binary_when_sample_cuts_multibyte_char(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env_replace(str(tmp_path)))
+        p = self._utf8_file_cut_mid_char(tmp_path)
+        result = ops.read_file_raw(str(p))
+        assert result.error is None
+        assert result.is_binary is False
+        assert "研" in result.content
+
+    def test_real_binary_file_still_flagged(self, tmp_path):
+        """The byte-domain probe must still catch a genuine binary file."""
+        ops = ShellFileOperations(make_real_subprocess_env_replace(str(tmp_path)))
+        p = tmp_path / "blob.bin"
+        p.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 500)
+        result = ops.read_file(str(p))
+        assert result.is_binary is True

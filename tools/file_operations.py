@@ -582,23 +582,101 @@ class ShellFileOperations(FileOperations):
             self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
     
-    def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
+    def _is_likely_binary(self, path: str, content_sample: Optional[str] = None,
+                          byte_stats: Optional[tuple] = None) -> bool:
         """
         Check if a file is likely binary.
-        
-        Uses extension check (fast) + content analysis (fallback).
+
+        Uses extension check (fast) + byte-domain analysis (primary) +
+        decoded-content analysis (fallback).
+
+        Args:
+            path: File path (extension used for the fast check).
+            content_sample: First ~1KB of the file as decoded by the terminal
+                env (``errors="replace"``). Only consulted when ``byte_stats``
+                is unavailable.
+            byte_stats: Optional ``(total_bytes, nul_count, control_count)``
+                from :meth:`_sample_binary_byte_stats`. When present it is
+                authoritative — it inspects the raw on-disk bytes instead of
+                the lossy decoded sample, so a truncated trailing multi-byte
+                char (which decodes to a phantom U+FFFD) can never
+                false-positive a UTF-8 text file as binary.
         """
         ext = os.path.splitext(path)[1].lower()
         if ext in BINARY_EXTENSIONS:
             return True
-        
-        # Content analysis: >30% non-printable chars = binary
+
+        # Byte-domain analysis (primary): any NUL byte or a heavy density of
+        # control bytes (value < 32, excluding tab/newline/CR) means binary.
+        # UTF-8 multi-byte text is safe here — its continuation bytes are all
+        # >= 0x80 and count as neither.
+        if byte_stats is not None:
+            total, nul_count, control_count = byte_stats
+            if nul_count > 0:
+                return True
+            if total and control_count / total > 0.30:
+                return True
+
+        # Decoded-content fallback (only used when raw byte stats are
+        # unavailable, e.g. the env's Python can't read the file). Undecodable
+        # bytes arrive as U+FFFD (ord 65533, "printable"), so the non-printable
+        # ratio alone can't catch them — and returning the lossy text would let
+        # a read→edit→write round-trip silently overwrite the original bytes
+        # with mojibake. Treat a sample carrying U+FFFD as binary (read-only).
+        #
+        # A trailing U+FFFD is NOT evidence of binary: ``head -c N`` can cut in
+        # the middle of a multi-byte UTF-8 char, and the incomplete trailing
+        # sequence decodes to exactly one phantom U+FFFD. Strip it (plus any
+        # trailing whitespace the cut may leave) before deciding.
         if content_sample:
-            non_printable = sum(1 for c in content_sample[:1000]
-                               if ord(c) < 32 and c not in '\n\r\t')
-            return non_printable / min(len(content_sample), 1000) > 0.30
-        
+            sample = content_sample[:_BINARY_SAMPLE_BYTES].rstrip("\ufffd \t\r\n")
+            if "\ufffd" in sample:
+                return True
+            non_printable = sum(1 for c in sample
+                                if ord(c) < 32 and c not in '\n\r\t')
+            return non_printable / max(len(sample), 1) > 0.30
         return False
+
+    def _sample_binary_byte_stats(self, path: str) -> Optional[tuple]:
+        """Read the first ``_BINARY_SAMPLE_BYTES`` bytes of ``path`` in binary
+        mode and return ``(total_bytes, nul_count, control_count)``.
+
+        ``control_count`` counts bytes < 32 excluding tab/newline/CR — the
+        control bytes that signal binary. Unlike the decoded text sample
+        (which passes through the terminal env's ``errors="replace"`` decode
+        and can carry a phantom U+FFFD from a truncated trailing multi-byte
+        char), these stats inspect the raw on-disk bytes, so multi-byte UTF-8
+        text can never be misjudged: its high bytes are all >= 0x80.
+
+        Runs via the env's own Python (``python3`` with a ``python`` fallback)
+        so it works on every backend — local, docker, ssh, and Windows shells.
+        Returns None when the file can't be read or neither python binary
+        exists; callers then fall back to the decoded-sample heuristics.
+        """
+        snippet = (
+            "import sys\n"
+            f"p = {path!r}\n"
+            f"n = {_BINARY_SAMPLE_BYTES}\n"
+            "try:\n"
+            "    with open(p, 'rb') as f:\n"
+            "        data = f.read(n)\n"
+            "except Exception:\n"
+            "    print('ERR'); sys.exit(1)\n"
+            "nul = data.count(b'\\x00')\n"
+            "ctrl = sum(1 for b in data if b < 32 and b not in (9, 10, 13))\n"
+            "print('%d %d %d' % (len(data), nul, ctrl))\n"
+        )
+        result = self._exec(f"python3 -c {self._escape_shell_arg(snippet)}")
+        if result.exit_code != 0 and "python3" in (result.stdout or ""):
+            result = self._exec(f"python -c {self._escape_shell_arg(snippet)}")
+        if result.exit_code != 0:
+            return None
+        try:
+            total, nul, ctrl = (int(part)
+                                for part in result.stdout.strip().split())
+            return total, nul, ctrl
+        except ValueError:
+            return None
     
     def _is_image(self, path: str) -> bool:
         """Check if file is an image we can return as base64."""
@@ -723,12 +801,18 @@ class ShellFileOperations(FileOperations):
                 ),
             )
         
-        # Read a sample to check for binary content
-        sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
+        # Read a sample to check for binary content. Byte-domain probe first:
+        # the decoded text sample below can carry a phantom U+FFFD when the
+        # sample cut lands mid multi-byte char, which would falsely flag
+        # UTF-8 text as binary. Byte stats inspect the raw on-disk bytes, so
+        # multi-byte UTF-8 can never be misjudged.
+        byte_stats = self._sample_binary_byte_stats(path)
+        sample_cmd = (f"head -c {_BINARY_SAMPLE_BYTES} "
+                      f"{self._escape_shell_arg(path)} 2>/dev/null")
         sample_result = self._exec(sample_cmd)
         sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
         
-        if self._is_likely_binary(path, sample_output):
+        if self._is_likely_binary(path, sample_output, byte_stats=byte_stats):
             return ReadResult(
                 is_binary=True,
                 file_size=file_size,
@@ -837,9 +921,12 @@ class ShellFileOperations(FileOperations):
             file_size = 0
         if self._is_image(path):
             return ReadResult(is_image=True, is_binary=True, file_size=file_size)
-        sample_result = self._exec(f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null")
+        byte_stats = self._sample_binary_byte_stats(path)
+        sample_result = self._exec(
+            f"head -c {_BINARY_SAMPLE_BYTES} "
+            f"{self._escape_shell_arg(path)} 2>/dev/null")
         sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
-        if self._is_likely_binary(path, sample_output):
+        if self._is_likely_binary(path, sample_output, byte_stats=byte_stats):
             return ReadResult(
                 is_binary=True, file_size=file_size,
                 error="Binary file — cannot display as text."
