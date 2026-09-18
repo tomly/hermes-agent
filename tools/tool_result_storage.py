@@ -58,14 +58,57 @@ def _resolve_storage_dir(env) -> str:
 
 
 def generate_preview(content: str, max_chars: int = DEFAULT_PREVIEW_SIZE_CHARS) -> tuple[str, bool]:
-    """Truncate at last newline within max_chars. Returns (preview, has_more)."""
+    """Generate a head+tail preview of content that exceeds max_chars.
+
+    Returns (preview, has_more).  When content fits within max_chars, returns
+    it unchanged with has_more=False.  When content is too large, the preview
+    includes the **first 60%** and **last 40%** of the budget (snapped to
+    newline boundaries), separated by an omission marker that shows the
+    character range and percentage of content omitted.
+
+    The head+tail strategy prevents the "silent middle drop" bug where
+    important structural content (e.g. GitHub Trending repo entries) falls in
+    the omitted section of a head-only preview, leaving only the navigation
+    / index block visible (Bug #1081).
+    """
     if len(content) <= max_chars:
         return content, False
-    truncated = content[:max_chars]
-    last_nl = truncated.rfind("\n")
-    if last_nl > max_chars // 2:
-        truncated = truncated[:last_nl + 1]
-    return truncated, True
+
+    # Budget split: 60% head, 40% tail — head gets more because consumers
+    # typically scan from the top.  Both sides snap to newline boundaries so
+    # the preview doesn't cut mid-line.
+    head_budget = int(max_chars * 0.6)
+    tail_budget = max_chars - head_budget
+
+    # --- Head ---
+    head_raw = content[:head_budget]
+    last_nl_head = head_raw.rfind("\n")
+    if last_nl_head > head_budget // 2:
+        head = head_raw[: last_nl_head + 1]
+    else:
+        head = head_raw
+
+    # --- Tail ---
+    tail_raw = content[-tail_budget:]
+    first_nl_tail = tail_raw.find("\n")
+    if first_nl_tail != -1 and first_nl_tail < tail_budget // 2:
+        tail = tail_raw[first_nl_tail + 1 :]
+    else:
+        tail = tail_raw
+
+    head_end = len(head)
+    tail_start = len(content) - len(tail)
+    omitted_chars = tail_start - head_end
+    omitted_pct = omitted_chars / len(content) * 100
+
+    omission_marker = (
+        f"\n... [{omitted_chars:,} chars omitted — "
+        f"{omitted_pct:.0f}% of {len(content):,} total chars, "
+        f"showing chars 0–{head_end:,} and {tail_start:,}–{len(content):,}] ...\n"
+    )
+
+    preview = head + omission_marker + tail
+    return preview, True
 
 
 def _heredoc_marker(content: str) -> str:
@@ -107,16 +150,37 @@ def _build_persisted_message(
     else:
         size_str = f"{size_kb:.1f} KB"
 
+    # Compute line coverage from the omission markers in the preview.
+    # The preview contains lines like "... [X chars omitted — Y% of Z total chars, showing chars 0–A and B–C] ..."
+    preview_pct = _compute_preview_coverage(preview, original_size)
+
     msg = f"{PERSISTED_OUTPUT_TAG}\n"
     msg += f"This tool result was too large ({original_size:,} characters, {size_str}).\n"
     msg += f"Full output saved to: {file_path}\n"
-    msg += "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
-    msg += f"Preview (first {len(preview)} chars):\n"
+    msg += "Use the read_file tool with offset and limit to access specific sections of this output.\n"
+    if preview_pct is not None:
+        msg += f"Preview covers ~{preview_pct:.0f}% of the full output.\n"
+    msg += f"\nPreview (first {len(preview)} chars):\n"
     msg += preview
     if has_more:
         msg += "\n..."
     msg += f"\n{PERSISTED_OUTPUT_CLOSING_TAG}"
     return msg
+
+
+def _compute_preview_coverage(preview: str, original_size: int) -> float | None:
+    """Extract the approximate coverage percentage from a head+tail preview.
+
+    Returns None if the preview doesn't contain an omission marker (legacy
+    head-only previews or complete content).
+    """
+    import re
+
+    m = re.search(r"(\d+)% of (\d[\d,]*) total chars", preview)
+    if not m:
+        return None
+    omitted_pct = float(m.group(1))
+    return 100.0 - omitted_pct
 
 
 def maybe_persist_tool_result(
@@ -171,9 +235,16 @@ def maybe_persist_tool_result(
         "Inline-truncating large tool result: %s (%d chars, no sandbox write)",
         tool_name, len(content),
     )
+    # Use the same head+tail preview (already generated above) so that
+    # inline truncation also gets tail coverage instead of head-only.
+    omitted_info = ""
+    if has_more:
+        omitted_chars = len(content) - len(preview)
+        omitted_pct = omitted_chars / len(content) * 100 if len(content) > 0 else 0
+        omitted_info = f" ({omitted_pct:.0f}% omitted — head+tail preview)"
     return (
         f"{preview}\n\n"
-        f"[Truncated: tool response was {len(content):,} chars. "
+        f"[Truncated: tool response was {len(content):,} chars{omitted_info}. "
         f"Full output could not be saved to sandbox.]"
     )
 

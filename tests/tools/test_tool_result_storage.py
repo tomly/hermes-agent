@@ -33,25 +33,37 @@ class TestGeneratePreview:
         assert preview == text
         assert has_more is False
 
-    def test_long_content_truncated(self):
+    def test_long_content_truncated_with_head_and_tail(self):
+        """Head+tail preview: both beginning and end of content are visible."""
         text = "x" * 5000
         preview, has_more = generate_preview(text, max_chars=2000)
-        assert len(preview) <= 2000
         assert has_more is True
+        assert len(preview) <= 2500  # head + tail + omission marker
+        # Must contain the beginning
+        assert preview.startswith("x")
+        # Must contain the tail (last characters)
+        assert preview.rstrip().endswith("x")
+        # Must have omission marker
+        assert "chars omitted" in preview
 
     def test_truncates_at_newline_boundary(self):
         # 1500 chars + newline + 600 chars  (past halfway)
         text = "a" * 1500 + "\n" + "b" * 600
         preview, has_more = generate_preview(text, max_chars=2000)
-        assert preview == "a" * 1500 + "\n"
+        # Head should snap to newline
+        assert "a" * 100 in preview  # at least part of the 'a' block
         assert has_more is True
+        # Tail should include 'b' block
+        assert "b" in preview
 
     def test_ignores_early_newline(self):
         # Newline at position 100, well before halfway of 2000
         text = "a" * 100 + "\n" + "b" * 3000
         preview, has_more = generate_preview(text, max_chars=2000)
-        assert len(preview) == 2000
         assert has_more is True
+        # Should still have both head and tail
+        assert "a" in preview
+        assert "b" in preview
 
     def test_empty_content(self):
         preview, has_more = generate_preview("")
@@ -63,6 +75,38 @@ class TestGeneratePreview:
         preview, has_more = generate_preview(text)
         assert preview == text
         assert has_more is False
+
+    def test_head_tail_preserves_ending_content(self):
+        """Regression test for Bug #1081: head+tail preview must include
+        content from the end of the original text, not just the beginning.
+
+        Simulates a GitHub Trending page where important repo entries
+        appear at the end after a large language index block."""
+        # Build content: boring index at start, important data at end
+        index_block = "lang_index_entry\n" * 500  # ~8,500 chars of filler
+        important_block = "IMPORTANT_REPO_ENTRY_" * 10  # ~210 chars at end
+        content = index_block + important_block
+
+        preview, has_more = generate_preview(content, max_chars=2000)
+        assert has_more is True
+        # The important end content MUST be visible in the preview
+        assert "IMPORTANT_REPO_ENTRY_" in preview, (
+            "Bug #1081 regression: tail of preview must include end-of-content"
+        )
+
+    def test_omission_marker_contains_percentage(self):
+        """Omission marker must show percentage of content omitted."""
+        content = "x" * 10000
+        preview, has_more = generate_preview(content, max_chars=2000)
+        assert has_more is True
+        assert "%" in preview
+        assert "chars omitted" in preview
+
+    def test_omission_marker_shows_char_ranges(self):
+        """Omission marker must show which char ranges are visible."""
+        content = "a" * 10000
+        preview, has_more = generate_preview(content, max_chars=2000)
+        assert "showing chars" in preview
 
 
 # ── _heredoc_marker ───────────────────────────────────────────────────
@@ -203,6 +247,24 @@ class TestBuildPersistedMessage:
             file_path="/tmp/hermes-results/big.txt",
         )
         assert "MB" in msg
+
+    def test_coverage_percentage_in_preview(self):
+        """When the preview contains a head+tail omission marker with
+        percentage, _build_persisted_message should extract and display
+        the coverage percentage."""
+        preview_with_marker = (
+            "head content\n"
+            "... [7,000 chars omitted — 70% of 10,000 total chars, "
+            "showing chars 0–1,500 and 8,500–10,000] ...\n"
+            "tail content"
+        )
+        msg = _build_persisted_message(
+            preview=preview_with_marker,
+            has_more=True,
+            original_size=10_000,
+            file_path="/tmp/hermes-results/coverage.txt",
+        )
+        assert "Preview covers ~30% of the full output" in msg
 
 
 # ── maybe_persist_tool_result ─────────────────────────────────────────

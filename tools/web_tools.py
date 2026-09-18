@@ -385,9 +385,16 @@ async def process_content_with_llm(
         processed_content = await _call_summarizer_llm(content, context_str, model)
         
         if processed_content:
-            # Enforce output cap
+            # Enforce output cap — use head+tail so the end of the
+            # summary (which often contains key takeaways) is not dropped.
             if len(processed_content) > MAX_OUTPUT_SIZE:
-                processed_content = processed_content[:MAX_OUTPUT_SIZE] + "\n\n[... summary truncated for context management ...]"
+                head_budget = int(MAX_OUTPUT_SIZE * 0.6)
+                tail_budget = MAX_OUTPUT_SIZE - head_budget
+                processed_content = (
+                    processed_content[:head_budget]
+                    + "\n\n[... summary truncated — showing head+tail ...]\n\n"
+                    + processed_content[-tail_budget:]
+                )
             
             # Log compression metrics
             processed_length = len(processed_content)
@@ -404,17 +411,26 @@ async def process_content_with_llm(
             str(e)[:120],
         )
         # Fall back to truncated raw content instead of returning a useless
-        # error message.  The first ~5000 chars are almost always more useful
-        # to the model than "[Failed to process content: ...]".
-        truncated = content[:MAX_OUTPUT_SIZE]
-        if len(content) > MAX_OUTPUT_SIZE:
-            truncated += (
-                f"\n\n[Content truncated — showing first {MAX_OUTPUT_SIZE:,} of "
-                f"{len(content):,} chars. LLM summarization timed out. "
-                f"To fix: increase auxiliary.web_extract.timeout in config.yaml, "
-                f"or use a faster auxiliary model. Use browser_navigate for the full page.]"
-            )
-        return truncated
+        # error message.  Use head+tail so important content at the end
+        # (e.g. GitHub Trending repos after a language index block) is not
+        # silently dropped (Bug #1081).
+        if len(content) <= MAX_OUTPUT_SIZE:
+            return content
+        head_budget = int(MAX_OUTPUT_SIZE * 0.6)
+        tail_budget = MAX_OUTPUT_SIZE - head_budget
+        head = content[:head_budget]
+        tail = content[-tail_budget:]
+        omitted_chars = len(content) - MAX_OUTPUT_SIZE
+        omitted_pct = omitted_chars / len(content) * 100
+        return (
+            head
+            + f"\n\n... [{omitted_chars:,} chars omitted — "
+            f"{omitted_pct:.0f}% of {len(content):,} total chars] ...\n\n"
+            + tail
+            + f"\n\n[Content truncated — showing head+tail ({omitted_pct:.0f}% omitted). "
+            f"LLM summarization failed. To fix: increase auxiliary.web_extract.timeout in config.yaml, "
+            "or use a faster auxiliary model. Use browser_navigate for the full page.]"
+        )
 
 
 async def _call_summarizer_llm(
