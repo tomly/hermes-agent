@@ -302,3 +302,127 @@ def test_child_attempting_default_complete_does_not_finish_parent_or_delete_work
     assert task.status == "running"
     assert run.status == "running"
     assert workspace.is_dir()
+
+
+def test_delegated_child_context_suppresses_kanban_stop_nudge(monkeypatch, tmp_path):
+    """Regression: delegate_task child must never trigger the kanban stop nudge.
+
+    Bug #1176 (Run 1489): a child agent that inherits the parent's
+    HERMES_KANBAN_TASK env var was incorrectly nudged to call
+    kanban_complete.  The nudge either wedged the child in a
+    reject-retry loop or, in edge-case context-timing windows,
+    completed the *parent's* task.  The fix gates
+    kanban_stop_nudge_enabled() on is_delegated_child_context().
+    """
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_f84c3b4c")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "999")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from agent.delegation_context import delegated_child_context
+    from agent.kanban_stop import build_kanban_stop_nudge, kanban_stop_nudge_enabled
+
+    # Without delegate context, nudge should be enabled (parent worker path)
+    assert kanban_stop_nudge_enabled() is True
+    nudge = build_kanban_stop_nudge(messages=[], attempts=0)
+    assert nudge is not None
+
+    # Inside delegate context, nudge must be completely suppressed
+    with delegated_child_context():
+        assert kanban_stop_nudge_enabled() is False
+        nudge = build_kanban_stop_nudge(messages=[], attempts=0)
+        assert nudge is None
+
+
+def test_complete_task_refuses_when_heartbeat_is_fresh_and_caller_has_wrong_run_id(
+    monkeypatch,
+    tmp_path,
+):
+    """Regression: complete_task refuses if a fresh heartbeat exists AND the
+    caller supplies an expected_run_id that does NOT match current_run_id.
+
+    Bug #1176 (Run 1489) hardening: a caller that explicitly identifies as a
+    different run (stale worker, manual retry with the wrong run id, etc.)
+    must not complete a task still held by a live worker.  Callers that omit
+    expected_run_id (CLI, fixtures) are allowed through — the primary defense
+    against delegate_task child completion is the nudge gate and tool-level
+    guard, not this DB-layer check.
+    """
+    kb, tid, workspace, _attachments_root = _make_running_kanban_task(monkeypatch, tmp_path)
+    from hermes_cli import kanban_db_connect as kbc
+
+    conn = kbc.connect()
+    try:
+        # Stamp a fresh heartbeat so the liveness guard fires
+        import time
+        now = int(time.time())
+        conn.execute(
+            "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
+            (now, tid),
+        )
+        conn.commit()
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        cur_run = task.current_run_id
+
+        # A completion with a DIFFERENT expected_run_id must be refused
+        ok = kb.complete_task(
+            conn, tid, summary="spurious",
+            expected_run_id=cur_run + 9999 if cur_run else 1,
+        )
+        assert ok is False, "complete_task must refuse when heartbeat is fresh and expected_run_id != current_run_id"
+
+        # Task should still be running
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+
+        # The legitimate worker (matching expected_run_id) CAN still complete
+        ok = kb.complete_task(
+            conn, tid, summary="legit",
+            expected_run_id=cur_run,
+        )
+        assert ok is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "done"
+    finally:
+        conn.close()
+
+
+def test_complete_task_allows_when_heartbeat_is_fresh_and_expected_run_id_is_none(
+    monkeypatch,
+    tmp_path,
+):
+    """Regression: complete_task must NOT refuse when expected_run_id is None.
+
+    Bug #1176 (Run 1489) gate revision: the initial liveness guard refused
+    when expected_run_id was None (because None != current_run_id), which
+    broke CLI completions and test fixtures that don't set
+    HERMES_KANBAN_RUN_ID.  The guard must only refuse callers that explicitly
+    identify as a different run; callers that omit expected_run_id are
+    legitimate (the primary defense is the nudge gate, not this check).
+    """
+    kb, tid, workspace, _attachments_root = _make_running_kanban_task(monkeypatch, tmp_path)
+    from hermes_cli import kanban_db_connect as kbc
+
+    conn = kbc.connect()
+    try:
+        # Stamp a fresh heartbeat
+        import time
+        now = int(time.time())
+        conn.execute(
+            "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
+            (now, tid),
+        )
+        conn.commit()
+
+        # Completion with expected_run_id=None (no env var / CLI path) must
+        # succeed even though the heartbeat is fresh
+        ok = kb.complete_task(conn, tid, summary="via CLI or fixture", expected_run_id=None)
+        assert ok is True, "complete_task must allow expected_run_id=None even with a fresh heartbeat"
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "done"
+    finally:
+        conn.close()

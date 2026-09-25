@@ -16,9 +16,23 @@ _DEFAULT_MAX_ATTEMPTS = 2
 
 
 def kanban_stop_nudge_enabled() -> bool:
-    """On when ``HERMES_KANBAN_TASK`` is set, unless ``HERMES_KANBAN_STOP_NUDGE`` disables it."""
+    """On when ``HERMES_KANBAN_TASK`` is set, unless ``HERMES_KANBAN_STOP_NUDGE`` disables it.
+
+    Delegate_task child agents must never trigger the nudge: they share the
+    parent's ``os.environ`` (so ``HERMES_KANBAN_TASK`` leaks in), but they are
+    not Kanban run owners.  Without this gate the child gets a spurious nudge
+    to call ``kanban_complete``, which either wedges the child in a
+    reject-retry loop or, in edge-case context-timing windows, completes the
+    *parent's* task (Bug #1176, Run 1489).
+    """
     if (os.environ.get("HERMES_KANBAN_STOP_NUDGE") or "").strip().lower() in {"0", "false", "no", "off"}:
         return False
+    try:
+        from agent.delegation_context import is_delegated_child_context
+        if is_delegated_child_context():
+            return False
+    except Exception:
+        pass  # import failure should not break the nudge for real workers
     return bool((os.environ.get("HERMES_KANBAN_TASK") or "").strip())
 
 

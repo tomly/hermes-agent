@@ -2541,8 +2541,42 @@ def complete_task(
     ``created_cards`` are verified first — a phantom id raises
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
+
+    Liveness guard (Bug #1176, Run 1489): if the task's ``last_heartbeat_at``
+    is fresh (within the last 120 seconds) and ``expected_run_id`` is present
+    but does NOT match the task's ``current_run_id``, the completion is refused.
+    This prevents a stale or out-of-context caller that explicitly identifies as
+    a different run from completing a task that still has a live worker.  Callers
+    that do not supply an ``expected_run_id`` (e.g. CLI ``hermes kanban complete``
+    or test fixtures) are allowed through, because the primary defense against
+    delegate_task child completion is the nudge gate in
+    ``kanban_stop_nudge_enabled()`` and the tool-level
+    ``_reject_delegated_child_mutation`` guard — not this DB-layer check.
     """
     now = int(time.time())
+    _FRESH_HEARTBEAT_SECONDS = 120
+    # Liveness guard: refuse completion when a live worker is still running
+    # and the caller is not that worker.
+    task_row = conn.execute(
+        "SELECT current_run_id, last_heartbeat_at FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if task_row is not None:
+        cur_run_id = _opt_int(task_row["current_run_id"])
+        hb_at = _opt_int(task_row["last_heartbeat_at"])
+        if (
+            hb_at is not None
+            and (now - hb_at) < _FRESH_HEARTBEAT_SECONDS
+            and cur_run_id is not None
+            and expected_run_id is not None
+            and expected_run_id != cur_run_id
+        ):
+            logging.warning(
+                "complete_task refused for %s: heartbeat is fresh (%ds ago), "
+                "current_run_id=%s, expected_run_id=%s — a live worker is still running",
+                task_id, now - hb_at, cur_run_id, expected_run_id,
+            )
+            return False
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
