@@ -802,3 +802,79 @@ def test_sudo_stdin_guard_container_bypass(clean_session):
         for cmd in _SUDO_STDIN_BLOCK:
             result = check_all_command_guards(cmd, env)
             assert result["approved"] is True, f"container {env} should bypass sudo guard on {cmd!r}"
+
+
+# =========================================================================
+# Heredoc body masking — regression guard for Bug 1166
+# =========================================================================
+# Cron tasks writing markdown reports with security research paper content
+# were hardline-blocked because heredoc body lines containing words like
+# "shutdown", "reboot", "halt", "poweroff" at line start matched the
+# _CMDPOS-anchored hardline rules.  Heredoc body text is DATA (stdin
+# content), not shell code.  The fix masks heredoc body content during
+# detection so only the command portion (e.g. ``cat > file``) is scanned.
+
+_HEREDOC_BODY_ALLOW = [
+    # cat heredoc with "shutdown" in body
+    "cat > /tmp/report.md <<EOF\nSecurity: shutdown procedures\nEOF",
+    # Single-quoted delimiter
+    "cat > /tmp/notes.txt <<'EOF'\nremember: reboot after deploy\nEOF",
+    # Double-quoted delimiter
+    'cat > /tmp/notes.txt <<"EOF"\nremember: halt the system\nEOF',
+    # <<- (strip-tabs) form
+    "cat > /tmp/y <<-TAB\n\thalt now\nTAB",
+    # Multiple heredocs
+    "cat > /tmp/a <<END1\nshutdown\nEND1\ncat > /tmp/b <<END2\nreboot\nEND2",
+    # Body line starting with the exact trigger word (the core bug symptom)
+    "cat > /tmp/report.md <<'EOF'\nshutdown -h now is discussed here\nreboot is another command\nEOF",
+    # poweroff and halt in body
+    "cat > /tmp/sec.md <<'EOF'\npoweroff the machine\nhalt command\nEOF",
+    # init 0/6 in body text
+    "cat > /tmp/ops.md <<EOF\ninit 0 and init 6 are runlevels\nEOF",
+]
+
+_HEREDOC_BODY_BLOCK = [
+    # The DELIVERY command itself is hardline — ``sudo reboot`` with a heredoc
+    # attached is still ``sudo reboot``, regardless of the body content.
+    "sudo reboot <<'EOF'\nignored\nEOF",
+    # bash << runs code — caught by DANGEROUS_PATTERNS (shell execution via
+    # heredoc), but the hardline rules must also fire on ``reboot`` if it's
+    # the actual command word (not body data).
+    "reboot <<'EOF'\ndata\nEOF",
+    # halt as the command, heredoc attached
+    "halt <<EOF\ndata\nEOF",
+]
+
+_HEREDOC_UNCLOSED_ALLOW = [
+    # Unclosed heredoc: body masked to end-of-string, no false positive
+    "cat > /tmp/x <<EOF\nshutdown now\nno closer",
+]
+
+
+@pytest.mark.parametrize("command", _HEREDOC_BODY_ALLOW)
+def test_heredoc_body_not_hardline_blocked(command):
+    """Heredoc body content must not trigger the hardline floor (Bug 1166)."""
+    is_hl, desc = detect_hardline_command(command)
+    assert not is_hl, (
+        f"heredoc body data false-positived the hardline floor: "
+        f"{command!r} (got: {desc})"
+    )
+
+
+@pytest.mark.parametrize("command", _HEREDOC_BODY_BLOCK)
+def test_heredoc_command_word_still_hardline_blocked(command):
+    """When the hardline trigger IS the command word (not body), it must still
+    be blocked — heredoc body masking must not suppress real threats."""
+    is_hl, desc = detect_hardline_command(command)
+    assert is_hl, f"real hardline command leaked through heredoc mask: {command!r}"
+    assert desc
+
+
+@pytest.mark.parametrize("command", _HEREDOC_UNCLOSED_ALLOW)
+def test_unclosed_heredoc_body_not_hardline_blocked(command):
+    """Unclosed heredoc body (mask to EOF) must not false-positive."""
+    is_hl, desc = detect_hardline_command(command)
+    assert not is_hl, (
+        f"unclosed heredoc body false-positived the hardline floor: "
+        f"{command!r} (got: {desc})"
+    )

@@ -1091,6 +1091,92 @@ def _mark_command_starts(command: str) -> str:
     return _splice(command, [(o, o, "\n") for o in offsets]) if offsets else command
 
 
+def _mask_heredoc_body(command: str) -> str:
+    """Mask heredoc body content for detection (detection-only rewrite).
+
+    A heredoc body — the lines between the opening ``<<DELIM`` line and the
+    closing delimiter line — is DATA passed to a command via stdin, not shell
+    code.  Without masking, lines in the body that begin with hardline triggers
+    (``shutdown``, ``reboot``, etc.) are falsely detected as commands because
+    the flat ``_CMDPOS`` class treats every raw newline as a command start.
+
+    This function replaces heredoc body CONTENT with spaces of the same length,
+    preserving newlines and the delimiter lines themselves.  The command
+    portion of the heredoc operator line (e.g. ``cat > file``) is kept intact
+    so it remains detectable.
+
+    Safety: masking heredoc bodies does not open a bypass because:
+    - Shell heredocs (``bash <<``, ``sh <<``, etc.) that execute code are
+      already caught by ``DANGEROUS_PATTERNS`` (``shell execution via heredoc``).
+    - Interpreter heredocs (``python3 <<``, ``perl <<``, etc.) that execute
+      code are caught by ``_execution_flag_findings()`` (``script execution via heredoc``).
+    - Those rules match the *operator* (``<<``), not the body content, so
+      masking the body cannot suppress them.
+
+    Unclosed heredocs (no closing delimiter before end-of-string) mask to
+    end-of-string, consistent with how unclosed quotes are handled — the shell
+    would not execute such a command either.
+    """
+    if "<<" not in command:
+        return command
+
+    # Regex to find heredoc operators: << or <<- followed by optional quote-wrapped delimiter.
+    # Matches: <<EOF, <<'EOF', <<"EOF", <<-EOF, <<-'EOF', <<-"EOF"
+    heredoc_op_re = re.compile(r"<<-?\s*(?:['\"]?)(\w+)(?:['\"]?)")
+
+    # Collect (body_start, body_end) spans to mask — body is between the newline
+    # after the heredoc operator and the start of the closing delimiter line.
+    edits: list[tuple[int, int]] = []
+    pos = 0
+    while pos < len(command):
+        match = heredoc_op_re.search(command, pos)
+        if not match:
+            break
+
+        # The body starts at the character after the first newline past the operator
+        body_start = command.find("\n", match.end())
+        if body_start == -1:
+            # No newline after the operator — no body to mask
+            pos = match.end()
+            continue
+        body_start += 1  # skip past the newline
+
+        delimiter = match.group(1)
+        search_pos = body_start
+        found_close = False
+        while search_pos < len(command):
+            line_end = command.find("\n", search_pos)
+            if line_end == -1:
+                # Last line (no trailing newline) — check if it's the delimiter
+                line = command[search_pos:]
+                if line.strip() == delimiter or line.lstrip("\t") == delimiter:
+                    edits.append((body_start, search_pos))
+                    found_close = True
+                # Either way, we've consumed the string
+                pos = len(command)
+                break
+            else:
+                line = command[search_pos:line_end]
+                if line.strip() == delimiter or line.lstrip("\t") == delimiter:
+                    edits.append((body_start, search_pos))
+                    found_close = True
+                    # Continue scanning after the closing delimiter line
+                    pos = line_end + 1
+                    break
+                search_pos = line_end + 1
+
+        if not found_close:
+            # Unclosed heredoc: mask body to end of string
+            edits.append((body_start, len(command)))
+            break  # nothing left to scan
+
+    if not edits:
+        return command
+
+    # Apply edits: replace each span's content with spaces of the same length
+    return _splice(command, [(start, end, " " * (end - start)) for start, end in edits])
+
+
 def _mask_quoted_newlines(command: str) -> str:
     """Replace raw newlines inside single/double quotes with a space (detection-only).
     A quoted newline is DATA to the shell, yet the flat ``_CMDPOS`` class treats every raw ``\\n``
@@ -1306,10 +1392,17 @@ def _deny_command_variants(command: str):
 
 
 def _command_detection_variants(command: str):
+    # Mask heredoc bodies BEFORE quoted-newline masking and normalization:
+    # heredoc body text is DATA (stdin content), not shell code, so lines
+    # starting with hardline triggers (shutdown, reboot) must not trip the
+    # floor.  Must run before normalization because normalization strips
+    # escapes that are part of heredoc syntax.  The command portion of the
+    # heredoc operator line (cat > file, etc.) is kept intact.
+    heredoc_masked = _mask_heredoc_body(command)
     # Mask quoted newlines BEFORE normalization: normalization strips escapes (\" -> ") and ""
     # pairs, corrupting quote tracking (`echo "a\""` becomes an unterminated quote) so masking
     # afterwards could swallow a REAL unquoted newline separator. The raw command carries faithful quote state.
-    normalized = _normalize_command_for_detection(_mask_quoted_newlines(command))
+    normalized = _normalize_command_for_detection(_mask_quoted_newlines(heredoc_masked))
     # Quote-aware grep parsing hides only structurally identified pattern operands; malformed or
     # ambiguous input stays byte-for-byte intact.
     grep_safe, _ = _grep_safe_detection_variant(normalized)
@@ -1328,7 +1421,7 @@ def _command_detection_variants(command: str):
     # POSIX escape semantics (`echo a\"b`) are untouched elsewhere.
     # See #69472.
     if re.search(r"(?:[A-Za-z]:|\\\\)[\\\\]", command) or re.search(r"[A-Za-z]:\\", command):
-        win_variant = _normalize_command_for_detection(_mask_quoted_newlines(command.replace("\\", "/")))
+        win_variant = _normalize_command_for_detection(_mask_quoted_newlines(heredoc_masked.replace("\\", "/")))
         if fresh(win_variant):
             yield win_variant
     # Program-bearing options are parsed in their owning command's context; surfacing only the payload lets the
