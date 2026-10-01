@@ -15,6 +15,9 @@ def _stale_plist(tmp_path, monkeypatch, *, registered: bool):
     monkeypatch.setattr(gw, "_launchd_domain", lambda: "gui/501")
     monkeypatch.setattr(gw, "_append_launchd_reload_log", lambda msg: None)
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    # pid=None now prefers the deferred helper (coalition-safe); force it unavailable so this
+    # fixture keeps exercising the in-process fallback path it was written to pin.
+    monkeypatch.setattr(gw, "_spawn_deferred_launchd_reload", lambda *a, **k: False)
     monkeypatch.setattr(gw, "_retry_launchctl_bootstrap_until_registered", lambda *a, **k: registered)
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: MagicMock(returncode=0))
 

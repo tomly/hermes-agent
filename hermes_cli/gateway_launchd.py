@@ -207,6 +207,46 @@ def _launchd_unsupported_marker_exists() -> bool:
     return _launchd_unsupported_marker_path().exists()
 
 
+# Reload-failed marker: written when a plist reload ends without launchd supervising a positive PID —
+# the silent state that strands the gateway (KeepAlive has no registered job to revive it after a
+# crash; the 2026-09-30 default-gateway outage was ~23h of exactly this). Same mechanism as the
+# unsupported marker above so status/inspection can alert; cleared by any later reload that ends
+# with a supervised PID.
+def _launchd_reload_failed_marker_path() -> Path:
+    return _gw().get_hermes_home() / ".gateway-launchd-reload-failed"
+
+
+def _write_launchd_reload_failed_marker(reason: str) -> None:
+    """Persist that the last plist reload left the service unregistered (launchd cannot revive it)."""
+    from datetime import datetime, timezone
+    payload = {
+        "written_at": datetime.now(timezone.utc).isoformat(),
+        "reason": reason,
+    }
+    with contextlib.suppress(OSError):
+        _launchd_reload_failed_marker_path().write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _clear_launchd_reload_failed_marker() -> None:
+    """Clear the reload-failed marker once a reload again ends with a supervised PID."""
+    with contextlib.suppress(OSError):
+        _launchd_reload_failed_marker_path().unlink(missing_ok=True)
+
+
+def _launchd_reload_failed_marker_exists() -> bool:
+    return _launchd_reload_failed_marker_path().exists()
+
+
+def _read_reload_failed_marker_reason() -> str | None:
+    """Human-readable reason from the reload-failed marker, for status/inspection display."""
+    try:
+        payload = json.loads(_launchd_reload_failed_marker_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    reason = payload.get("reason") if isinstance(payload, dict) else None
+    return reason if isinstance(reason, str) else None
+
+
 def _gateway_run_command() -> list[str]:
     from hermes_cli._launchers import runtime_command
     return runtime_command(_gw().PROJECT_ROOT, [*shlex.split(_gw()._profile_arg()), "gateway", "run", "--replace"],
@@ -467,11 +507,13 @@ def launchd_plist_is_current() -> bool:
 
 
 def _spawn_deferred_launchd_reload(
-    *, domain: str, label: str, target: str, plist_path: Path, gateway_pid: int
+    *, domain: str, label: str, target: str, plist_path: Path, gateway_pid: int | None
 ) -> bool:
     """Hand the bootout/bootstrap cycle to a transient ``launchctl submit`` job; True if spawned. The
     helper waits for the OLD gateway to exit (bootstrap during drain fails EIO), then retries bootstrap
-    until ``launchctl list`` shows a positive PID or the drain budget elapses."""
+    until ``launchctl list`` shows a positive PID or the drain budget elapses. ``gateway_pid`` may be
+    None (the pid lookup failed, which proves nothing about coalition membership): the drain wait is
+    then skipped and the bootstrap retries absorb a still-draining gateway instead."""
     reload_log_path = _launchd_reload_log_path()
     with contextlib.suppress(OSError):
         reload_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -481,28 +523,43 @@ def _spawn_deferred_launchd_reload(
 
     _reload_budget = int(_launchd_reload_budget())
     q_target, q_label, q_log = shlex.quote(target), shlex.quote(label), shlex.quote(str(reload_log_path))
+    q_marker = shlex.quote(str(_launchd_reload_failed_marker_path()))
     stamp = "$(date '+%Y-%m-%d %H:%M:%S %z')"
     # Require a POSITIVE PID: `launchctl list` also exits 0 for a registered-but-not-running
     # definition, and a crashed job reports `"PID" = -1` (mirrors _parse_launchd_pid_from_list_output).
     listed = f"launchctl list {q_label} 2>/dev/null | grep -qE '\\\"PID\\\" = [0-9]+;'"
     # Unique per reload so concurrent/repeated reloads never collide.
     submit_label = f"{label}.reload.{os.getpid()}.{int(time.time())}"
+    # The drain wait needs a real pid to watch; without one the bootstrap retry loop's EIO retries
+    # cover the still-draining old gateway.
+    wait_old_gateway = ""
+    if gateway_pid is not None and gateway_pid > 0:
+        wait_old_gateway = (
+            f"_wait_deadline=$(($(date +%s) + {_reload_budget})); "
+            f"while kill -0 {gateway_pid} 2>/dev/null; do   if [ $(date +%s) -ge $_wait_deadline ]; then "
+            f"    echo \"[{stamp}] old gateway pid {gateway_pid} still alive after {_reload_budget}s drain wait — bootstrapping anyway\" >> {q_log}; "
+            f"    break;   fi;   sleep 1; done; "
+        )
     reload_script = (
         f"sleep 2; "
         f"launchctl bootout {q_target} 2>/dev/null; "
         # Wait for the OLD gateway to exit: bootout only SIGTERMs and every bootstrap during the drain fails EIO.
-        f"_wait_deadline=$(($(date +%s) + {_reload_budget})); "
-        f"while kill -0 {gateway_pid} 2>/dev/null; do   if [ $(date +%s) -ge $_wait_deadline ]; then "
-        f"    echo \"[{stamp}] old gateway pid {gateway_pid} still alive after {_reload_budget}s drain wait — bootstrapping anyway\" >> {q_log}; "
-        f"    break;   fi;   sleep 1; done; "
+        f"{wait_old_gateway}"
         # Let launchd finish unregistering the label after the process exits.
         f"sleep 1; _deadline=$(($(date +%s) + {_reload_budget})); while :; do "
         f"  launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null; "
         f"  if {listed}; then break; fi; "
         f"  echo \"[{stamp}] bootstrap not yet registered for {q_target} — retrying\" >> {q_log}; "
         f"  if [ $(date +%s) -ge $_deadline ]; then break; fi;   sleep 2; done; "
-        f"if ! {listed}; then "
+        # The verdict is the POSITIVE-PID check above, never an exit code: clear the reload-failed
+        # marker on success, write it on failure so status/inspection can alert (KeepAlive cannot
+        # revive an unregistered job — this marker is the difference between a logged error and a
+        # 23h silent outage).
+        f"if {listed}; then "
+        f"  rm -f {q_marker} 2>/dev/null; "
+        f"else "
         f"  echo \"[{stamp}] FAILED launchd reload for {q_target} — service NOT registered after {_reload_budget}s of retries\" >> {q_log}; "
+        f"  printf '{{\"written_at\": \"%s\", \"reason\": \"launchd reload of %s ended without a supervised PID\"}}\\n' \"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\" {q_target} > {q_marker} 2>/dev/null; "
         f"fi; "
         # Submitted jobs stay registered after the script exits; removing our own label ends the one-shot job.
         f"launchctl remove {shlex.quote(submit_label)} 2>/dev/null"
@@ -560,11 +617,13 @@ def refresh_launchd_plist_if_needed() -> bool:
         gateway_pid = None
 
     # POSIX ancestry is NOT a reliable "bootout will kill us" test (coalition membership survives
-    # reparenting), so always prefer the detached helper; in-process is only the spawn-failure fallback.
-    if (
-        gateway_pid is not None
-        and hasattr(os, "setsid")  # POSIX-only; launchd is macOS so always true here
-    ) and _spawn_deferred_launchd_reload(
+    # reparenting), and an UNKNOWN pid proves even less: a stale pid file or a failed lookup does not
+    # mean this process is outside the gateway's coalition, and the in-process bootout would then
+    # kill this CLI (and the gateway) before bootstrap ran — leaving the plist freshly written but
+    # the job unregistered, so the gateway's next "let the service manager revive us" exit strands
+    # the service for as long as it takes a human to notice (2026-09-30: ~23h). So ALWAYS hand the
+    # reload to the transient launchd job; in-process is only the spawn-failure fallback.
+    if hasattr(os, "setsid") and _gw()._spawn_deferred_launchd_reload(
         domain=domain, label=label, target=target, plist_path=plist_path, gateway_pid=gateway_pid
     ):
         print(
@@ -590,11 +649,16 @@ def refresh_launchd_plist_if_needed() -> bool:
             f"FAILED launchd reload of {target} — service NOT registered after "
             f"retrying for {int(_reload_budget)}s (in-process fallback path)"
         )
+        _gw()._write_launchd_reload_failed_marker(
+            f"launchd reload of {target} ended without a supervised PID "
+            f"(in-process fallback, retried for {int(_reload_budget)}s)"
+        )
         _gw().logger.error(
             "launchd reload of %s failed — service not registered after %ds of retries; see %s",
             target, int(_reload_budget), _launchd_reload_log_path(),
         )
         return False
+    _gw()._clear_launchd_reload_failed_marker()
     print("↻ Updated gateway launchd service definition to match the current Hermes install")
     return True
 
@@ -657,6 +721,7 @@ def launchd_install(force: bool = False, *, start_now: bool = True):
     print()
     print("✓ Service installed and loaded!")
     _gw()._clear_launchd_unsupported_marker()
+    _gw()._clear_launchd_reload_failed_marker()
     print()
     print("Next steps:")
     print("  hermes gateway status             # Check status")
@@ -721,10 +786,16 @@ def _launchd_bootstrap_and_kickstart(plist_path: Path, label: str) -> bool:
     return True
 
 
-def _launchd_ok(message: str) -> None:
-    """Print a launchd success line and clear the unsupported marker (an OS fix recovers automatically)."""
+def _launchd_ok(message: str, *, supervision_verified: bool = True) -> None:
+    """Print a launchd success line and clear the unsupported marker (an OS fix recovers automatically).
+    ``supervision_verified=False`` (a self-restart whose revival launchd has not proven yet) keeps a
+    reload-failed marker: the gateway exiting into an unregistered job is exactly the silent-outage
+    state it exists to warn about."""
     print(message)
     _gw()._clear_launchd_unsupported_marker()
+    if supervision_verified:
+        # The service is demonstrably (re)registered, so a past reload failure is no longer current.
+        _gw()._clear_launchd_reload_failed_marker()
 
 
 def launchd_stop():
@@ -783,7 +854,9 @@ def launchd_restart():
     try:
         pid = get_running_pid()
         if pid is not None and _gw()._request_gateway_self_restart(pid):
-            _launchd_ok("✓ Service restart requested")
+            # The gateway restarts itself; whether KeepAlive revives it is not yet proven, so a
+            # reload-failure marker must survive this success line.
+            _launchd_ok("✓ Service restart requested", supervision_verified=False)
             return
         if pid is not None and _gw().probe_gateway_loop_liveness(pid) == _gw().GATEWAY_LOOP_WEDGED:
             # Event loop provably dead: it can't process a graceful shutdown, so a full drain wait
@@ -909,6 +982,9 @@ def launchd_status(deep: bool = False):
 
     # Marker from a 5/125 bootstrap/kickstart failure explains *why* launchd can't supervise.
     launchd_unsupported = _gw()._launchd_unsupported_marker_exists()
+    # Marker from a reload that ended without a supervised PID: the plist may be freshly written
+    # while the job is unregistered — KeepAlive then has nothing to revive after a crash.
+    reload_failed = _gw()._launchd_reload_failed_marker_exists()
 
     print(f"Launchd plist: {plist_path}")
     if _gw().launchd_plist_is_current():
@@ -943,6 +1019,17 @@ def launchd_status(deep: bool = False):
         print(list_output)
         if fallback_pid:
             print(f"  Detached gateway process is running (PID {fallback_pid})")
+
+    if reload_failed and launchd_pid is None:
+        reason = _gw()._read_reload_failed_marker_reason()
+        print("✗ The last launchd reload failed — the service definition was rewritten but never")
+        print("  re-registered, so launchd CANNOT revive the gateway after a crash or exit.")
+        if reason:
+            print(f"  Reason: {reason}")
+        from hermes_constants import display_hermes_home as _dhh
+        print(f"  See {_dhh()}/logs/launchd-reload.log; recover with: hermes gateway install --force")
+    elif reload_failed:
+        print("  (a previous reload failed, but the service is supervised again — stale marker)")
 
     if deep:
         log_file = _gw().get_hermes_home() / "logs" / "gateway.log"
