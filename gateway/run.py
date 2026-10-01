@@ -2936,13 +2936,15 @@ def _resolve_hermes_bin() -> Optional[list[str]]:
     """Hermes update/restart argv: the running interpreter's ``python -m hermes_cli.main``
     (exactly this install), else ``hermes`` on PATH, else None. The module argv must win: a
     PATH-first lookup lets an attacker-planted ``hermes`` shadow the running install when
-    /update or /restart re-execs it (#111569)."""
-    try:
-        import importlib.util
-        if importlib.util.find_spec("hermes_cli") is not None:
-            return [sys.executable, "-m", "hermes_cli.main"]
-    except Exception:
-        pass
+    /update or /restart re-execs it (#111569). The module form is only offered when a fresh
+    child of this interpreter can import ``hermes_cli`` — a ``python -c`` gateway running
+    under a bare interpreter imports the package through its in-script ``sys.path`` insert,
+    and re-exec'ing the module form there dies with ``ModuleNotFoundError`` (same root cause
+    as the 2026-10-01 kanban worker crashes)."""
+    from hermes_cli.install_shape import module_argv_child_viable
+
+    if module_argv_child_viable():
+        return [sys.executable, "-m", "hermes_cli.main"]
     import shutil
     hermes_bin = shutil.which("hermes")
     if hermes_bin:

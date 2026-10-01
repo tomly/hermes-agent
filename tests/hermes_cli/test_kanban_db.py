@@ -1595,6 +1595,61 @@ def test_resolve_hermes_argv_module_actually_runs():
     )
 
 
+def test_resolve_hermes_argv_injected_runtime_falls_back_to_path(monkeypatch, tmp_path):
+    """Regression (fleet incident 2026-10-01 — the corrected root cause of
+    #1243's symptom): a gateway launched by a bare interpreter via ``python -c``
+    plus an in-script ``sys.path.insert`` imports ``hermes_cli`` only through
+    that runtime injection; its site-packages has no hermes, the spawned worker
+    starts with clean interpreter state (cwd = task workspace, Hermes-owned
+    PYTHONPATH entries stripped from the spawn env), so every worker died with
+    ``ModuleNotFoundError: No module named 'hermes_cli'`` until the respawn
+    breaker parked the cards as ``blocked``. In that runtime shape the resolver
+    must fall back to the ``hermes`` wrapper on PATH (the wrapper carries its
+    own path injection); when the process cwd IS the package root (``python -m``
+    / pytest from the checkout), the module form must keep winning over a
+    planted PATH shim (#111569) — ``find_spec`` hitting is no longer the whole
+    viability question, only half of it."""
+    import importlib.util
+    import shutil
+    from types import SimpleNamespace
+
+    from hermes_cli import install_shape
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    injected_root = tmp_path / "hermes-agent"
+    package_dir = injected_root / "hermes_cli"
+    package_dir.mkdir(parents=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+
+    def fake_find_spec(name, *args, **kwargs):
+        if name == "hermes_cli":
+            return SimpleNamespace(
+                origin=str(package_dir / "__init__.py"),
+                submodule_search_locations=None,
+            )
+        return None
+
+    # Hermetic against ambient environments (editable venvs) whose site dirs DO
+    # serve hermes: the gateway-under-test sees an interpreter that serves none.
+    empty_site = tmp_path / "site-packages"
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+    monkeypatch.setattr(install_shape, "_interpreter_package_roots", lambda: [empty_site])
+    monkeypatch.delenv("HERMES_BIN", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda name: "/opt/hermes/bin/hermes")
+    monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/opt/hermes/bin/hermes")
+
+    # cwd is neither the package root nor served: the injected-runtime shape.
+    monkeypatch.chdir(tmp_path)
+    assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"], (
+        "a sys.path-injected runtime must not hand workers a module argv their "
+        "interpreter cannot import"
+    )
+
+    # Source-tree launch (cwd serves the package): module form stays first.
+    monkeypatch.chdir(injected_root)
+    assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+
+
 # ---------------------------------------------------------------------------
 # task_age — guard against corrupt timestamp values
 #
