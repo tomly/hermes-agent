@@ -875,12 +875,12 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
     # The running install first (same trust order as gateway.run._resolve_hermes_bin): the
     # scheduler lives in the long-running gateway, so a PATH-first lookup would hand delivery
     # to whatever `hermes` PATH names — another install, or a planted one — instead of this one.
-    try:
-        import importlib.util as _ilu
-        found = _ilu.find_spec("hermes_cli") is not None
-    except Exception:
-        found = False
-    if found:
+    # The module form is only offered when a fresh child of this interpreter can import
+    # hermes_cli: a gateway running under a bare interpreter via an in-script sys.path insert
+    # imports the package itself, but the delivery subprocess would die with
+    # ModuleNotFoundError (same root cause as the 2026-10-01 kanban worker crashes).
+    from hermes_cli.install_shape import module_argv_child_viable
+    if module_argv_child_viable():
         argv = [sys.executable, "-m", "hermes_cli.main"]
     else:
         hermes_bin = shutil.which("hermes")
