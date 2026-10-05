@@ -533,6 +533,20 @@ def task_attachments_dir(task_id: str, board: Optional[str] = None) -> Path:
     return attachments_root(board=board) / task_id
 
 
+def workspaces_archive_root(board: Optional[str] = None) -> Path:
+    """Persistent archive for finished scratch workspaces: ``default`` ->
+    ``<root>/kanban/workspaces-archive/``; named boards -> ``<board_dir>/workspaces-archive/``.
+    Scratch cleanup MOVES a still-populated workspace here instead of deleting
+    it, so deliverables that downstream cards reference by path survive the
+    task's completion; retention and a capacity cap (see
+    ``kanban_db_workspace._prune_workspaces_archive``) keep the guarantee
+    bounded. Not env-overridable on purpose: it must sit beside
+    :func:`workspaces_root` on the same volume so the preserve step stays a
+    same-volume rename, and outside every managed scratch root so a future
+    task's cleanup can never mistake the archive for deletable scratch."""
+    return _board_path(None, board, ("kanban", "workspaces-archive"), "workspaces-archive")
+
+
 def worker_logs_dir(board: Optional[str] = None) -> Path:
     """Per-board worker log dir (logs follow the board so ``hermes kanban log``
     is unambiguous when two boards share a task id)."""
@@ -3098,7 +3112,11 @@ def _discard_staged_copies(copies: Iterable[Path], attachment_dir: Path) -> None
 
 
 def _copy_capped(src: Path, dest: Path, artifact: str) -> None:
-    """Chunked copy that aborts if the file grows past the attachment cap mid-copy."""
+    """Chunked copy that aborts if the file grows past the attachment cap mid-copy,
+    and refuses to register a truncated copy: a staged attachment must equal the
+    source byte-for-byte in length, or completion rolls back and the worker
+    retries (a silently short video/zip is the corruption class this guards)."""
+    expected = src.stat().st_size
     with src.open("rb") as source_file, dest.open("xb") as destination_file:
         copied = 0
         while chunk := source_file.read(1024 * 1024):
@@ -3108,6 +3126,11 @@ def _copy_capped(src: Path, dest: Path, artifact: str) -> None:
                     f"declared scratch artifact grew beyond the size limit: {artifact}"
                 )
             destination_file.write(chunk)
+    if copied != expected:
+        raise ArtifactPreservationError(
+            f"staged copy of {artifact} is truncated ({copied} of {expected} bytes); "
+            "the source changed while it was being copied"
+        )
 
 
 def _insert_completion_attachment(
