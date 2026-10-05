@@ -1,4 +1,4 @@
-"""Task workspace lifecycle: scratch/dir/worktree resolution (incl. git worktree creation), post-completion cleanup with containment guards, worker tmux teardown and the first-use scratch-workspace tip.
+"""Task workspace lifecycle: scratch/dir/worktree resolution (incl. git worktree creation), post-completion cleanup with containment guards, preserve-to-archive disposal for populated scratch trees, worker tmux teardown and the first-use scratch-workspace tip.
 
 Split out of ``hermes_cli.kanban_db``; origin-resident helpers are reached
 late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
@@ -130,8 +130,10 @@ def _is_managed_scratch_path(p: Path) -> bool:
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
     Called from :func:`complete_task` after the transaction commits; best-effort
-    so cleanup never blocks completion. ``scratch`` is removed; ``worktree``
-    only when provably free of work (clean tree, every commit reachable from a
+    so cleanup never blocks completion. A ``scratch`` tree is deleted when empty
+    and MOVED to the board's persistent ``workspaces-archive`` when it still
+    holds files (see :func:`_dispose_scratch_dir`); ``worktree`` is removed only
+    when provably free of work (clean tree, every commit reachable from a
     remote-tracking ref); ``dir`` is intentionally preserved."""
     try:
         row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
@@ -167,10 +169,10 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # ``workspace_kind='scratch'`` with a user path pointing at a real
             # source tree; without this, completion would rmtree the user's data.
             # See #28818.
-            if _is_managed_scratch_path(wp):
+            managed, board = _managed_scratch_path_info(wp)
+            if managed:
                 release_lsp_clients(str(wp))
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Removed scratch workspace: %s", wp)
+                _dispose_scratch_dir(conn, task_id, wp, board)
             else:
                 _kb._log.warning(
                     "Refusing to remove out-of-scratch workspace for task %s: %s "
@@ -286,12 +288,155 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 _cleanup_worktree_workspace(parent_id, row["workspace_path"], row["branch_name"])
                 continue
             wp = Path(row["workspace_path"])
-            if wp.is_dir() and _is_managed_scratch_path(wp):
+            managed, board = _managed_scratch_path_info(wp)
+            if wp.is_dir() and managed:
                 release_lsp_clients(str(wp))
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+                _dispose_scratch_dir(conn, parent_id, wp, board)
+                _kb._log.debug("Deferred cleanup: disposed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:
         pass  # best-effort
+
+
+# ---------------------------------------------------------------------------
+# Preserve-to-archive scratch disposal
+#
+# Scratch cleanup used to ``rmtree`` the whole tree on completion/archive.
+# Workers routinely leave work in it that the declared-artifacts channel never
+# captured: files over the 25 MB attachment cap (the worker is forced to drop
+# them from ``metadata["artifacts"]`` and complete anyway), directories of
+# keyframes/renders, files referenced only by path in downstream cards'
+# summaries. Deleting the tree severed every one of those references
+# (t_b660d45c's candidates/keyframes/delivery-zip under t_12835fc7's scratch).
+# Disposal is now: empty -> delete; populated -> MOVE the tree to the board's
+# persistent ``workspaces-archive`` (retention + capacity bounded); move
+# failed -> keep it in place and record an audit event. Deleting work is never
+# the fallback.
+# ---------------------------------------------------------------------------
+
+WORKSPACES_ARCHIVE_RETENTION_SECONDS = 14 * 24 * 3600
+WORKSPACES_ARCHIVE_MAX_TOTAL_BYTES = 5 * 1024 ** 3
+
+
+def _workspaces_archive_dir(board: Optional[str]) -> Path:
+    """Archive dir for *board*'s managed scratch storage. A workspace matched
+    via the ``HERMES_KANBAN_WORKSPACES_ROOT`` override (``board`` is ``None``)
+    archives as a sibling of that root so the move stays a same-volume rename;
+    every other case resolves through the per-board root."""
+    if board is None:
+        override = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
+        if override:
+            root = Path(override).expanduser().resolve(strict=False)
+            return root.parent / f"{root.name}-archive"
+    return _kb.workspaces_archive_root(board=board or _kb.DEFAULT_BOARD)
+
+
+def _tree_size_bytes(p: Path) -> int:
+    """Total bytes of regular files under *p*; unreadable entries count as 0."""
+    total = 0
+    for f in p.rglob("*"):
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _append_cleanup_event(
+    conn: sqlite3.Connection, task_id: str, kind: str, payload: dict,
+) -> None:
+    """Best-effort audit event for a cleanup disposition (own txn — cleanup
+    runs after the completion/archive commit)."""
+    try:
+        with _kb.write_txn(conn):
+            _kb._append_event(conn, task_id, kind, payload)
+    except Exception:
+        pass  # audit only — must never block completion
+
+
+def _move_to_workspaces_archive(wp: Path, archive_root: Path, task_id: str) -> Path:
+    """Move the populated scratch tree to ``archive_root/<task_id>``, suffixing
+    on the rare re-disposition of an already-archived id. ``shutil.move`` tries
+    an os-rename first, so same-volume moves stay atomic."""
+    archive_root.mkdir(parents=True, exist_ok=True)
+    dest = archive_root / task_id
+    suffix = 1
+    while dest.exists():
+        suffix += 1
+        dest = archive_root / f"{task_id}-{suffix}"
+    shutil.move(str(wp), str(dest))
+    return dest
+
+
+def _prune_workspaces_archive(archive_root: Path, *, now: Optional[float] = None) -> None:
+    """Bound the archive so the preservation guarantee cannot fill the disk:
+    drop task dirs past the retention window, then evict oldest-first until
+    the total fits the capacity cap. Constants live on this module so tests
+    (and installs) can tighten them."""
+    try:
+        entries = [e for e in archive_root.iterdir() if e.is_dir()]
+    except OSError:
+        return
+    if not entries:
+        return
+    clock = time.time() if now is None else now
+
+    def _mtime(e: Path) -> float:
+        try:
+            return e.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    entries.sort(key=_mtime)
+    survivors: list[tuple[Path, int]] = []
+    for entry in entries:
+        if clock - _mtime(entry) > WORKSPACES_ARCHIVE_RETENTION_SECONDS:
+            shutil.rmtree(entry, ignore_errors=True)
+            continue
+        survivors.append((entry, _tree_size_bytes(entry)))
+    total = sum(size for _, size in survivors)
+    for entry, size in survivors:
+        if total <= WORKSPACES_ARCHIVE_MAX_TOTAL_BYTES:
+            break
+        shutil.rmtree(entry, ignore_errors=True)
+        total -= size
+
+
+def _dispose_scratch_dir(
+    conn: sqlite3.Connection, task_id: str, wp: Path, board: Optional[str],
+) -> None:
+    """Final disposition of a finished managed scratch dir: delete when empty;
+    move a populated one to the persistent workspaces archive; if the move
+    fails, keep it in place with an ``unarchived_scratch_files`` event. A
+    ``scratch_workspace_archived`` event names the archive path so downstream
+    cards referencing the old locations can be re-pointed. Best-effort — the
+    callers' blanket guard means a raise here never blocks completion."""
+    try:
+        populated = next(wp.iterdir(), None) is not None
+    except OSError:
+        populated = False
+    if not populated:
+        shutil.rmtree(wp, ignore_errors=True)
+        _kb._log.debug("Removed empty scratch workspace: %s", wp)
+        return
+    archive_root = _workspaces_archive_dir(board)
+    try:
+        dest = _move_to_workspaces_archive(wp, archive_root, task_id)
+    except Exception as exc:
+        _kb._log.warning(
+            "Preserving scratch workspace in place for task %s: archive move to "
+            "%s failed: %s", task_id, archive_root, exc,
+        )
+        _append_cleanup_event(conn, task_id, "unarchived_scratch_files",
+                              {"path": str(wp), "error": str(exc)})
+        return
+    _append_cleanup_event(conn, task_id, "scratch_workspace_archived",
+                          {"path": str(dest), "bytes": _tree_size_bytes(dest)})
+    _kb._log.info(
+        "Archived populated scratch workspace for task %s: %s -> %s",
+        task_id, wp, dest,
+    )
+    _prune_workspaces_archive(archive_root)
 
 
 def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
