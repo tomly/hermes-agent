@@ -364,6 +364,80 @@ class TestMemoryConsolidationGracefulDegrade:
         assert r.get("done") is not True
 
 
+class TestMemoryOscillationBreaker:
+    """Regression for the run-1855 cmo death loop: with MEMORY.md near capacity the
+    model ping-ponged memory add/remove 543 times in one session (capacity bouncing in
+    a 94%-95% band). Every call "succeeded", so the per-turn consolidation-failure
+    breaker (#42405) never saw a failure and each success reset it. Locks three
+    behaviors: (1) a freeing write only resets the failure budget once it covers the
+    failed add's shortage, (2) a session-level oscillation latch terminates the
+    all-success ping-pong, (3) >90%-full failures carry deterministic delete targets."""
+
+    def test_add_overflow_remove_success_loop_degrades_to_terminal(self, store):
+        """The run-1855 verification scenario: add over-limit -> remove succeeds ->
+        add over-limit again. Each remove frees less than the pending add needs, so it
+        must NOT reset the per-turn failure budget; the loop degrades to a TERMINAL
+        result within the failure cap instead of oscillating forever (pre-fix the
+        budget reset on every remove and the loop ran to the iteration budget)."""
+        for chunk in ("a" * 200, "b" * 200, "tiny1", "tiny2", "tiny3"):
+            assert store.add("memory", chunk)["success"] is True
+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
+        garbage = "x" * 100  # needs 103 free chars; each tiny remove frees 8
+        terminal = None
+        for round_ in range(2 * cap):
+            r = store.add("memory", garbage)
+            if r.get("done"):
+                terminal = r
+                break
+            assert r["success"] is False
+            # 80-85% full here: below the >90% gate, no suggestions expected.
+            assert "consolidation_suggestions" not in r
+            assert store.remove("memory", f"tiny{round_ + 1}")["success"] is True
+        assert terminal is not None, "add-overflow/remove-success oscillation never degraded to TERMINAL"
+        assert terminal["success"] is False
+        assert "Stop retrying" in terminal["error"]
+        assert store._consolidation_failures > cap  # net-zero removes never reset the budget
+
+    def test_net_zero_add_remove_ping_pong_latches_session(self, store):
+        """The all-success ping-pong (the 543-call incident shape): no call ever fails,
+        so only the session-level capacity-oscillation latch can stop it. After the
+        latch, capacity-raising writes are refused TERMINAL without persisting, while
+        a reducing write still goes through so the session can consolidate."""
+        assert store.add("memory", "a" * 300)["success"] is True  # 60% full: not the >90% path
+        garbage = "x" * 50
+        adds_landed = 0
+        for _ in range(50):
+            r = store.add("memory", garbage)
+            if not r["success"]:
+                assert r["done"] is True
+                assert "oscillat" in r["error"].lower()
+                break
+            adds_landed += 1
+            assert store.remove("memory", garbage)["success"] is True
+        else:
+            pytest.fail("net-zero add/remove ping-pong never latched the session breaker")
+        assert adds_landed >= 2  # the loop ran before the latch, then terminated
+        assert store.memory_entries == ["a" * 300]  # the refused write was not persisted
+        # Reducing writes stay allowed so the session can recover by consolidating.
+        assert store.replace("memory", "a" * 300, "consolidated")["success"] is True
+        assert store.memory_entries == ["consolidated"]
+
+    def test_overflow_failure_lists_deterministic_consolidation_targets(self, store):
+        """At >90% capacity an over-limit add must point at concrete entries (the 3
+        longest, as 1-based positions with estimated freed chars) instead of leaving
+        the model to improvise remove rounds that free less than the add needs."""
+        for chunk in ("a" * 200, "b" * 150, "c" * 100, "tail"):
+            assert store.add("memory", chunk)["success"] is True  # 463/500 = 92% full
+        r = store.add("memory", "w" * 50)
+        assert r["success"] is False
+        assert "current_entries" in r  # actionable feedback kept
+        suggestions = r["consolidation_suggestions"]
+        assert len(suggestions) == 3
+        assert suggestions[0].startswith("1. (~203 chars)")
+        assert suggestions[1].startswith("2. (~153 chars)")
+        assert suggestions[2].startswith("3. (~103 chars)")
+
+
 class TestMemoryStorePersistence:
     def test_save_and_load_roundtrip(self, tmp_path, monkeypatch):
         monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
