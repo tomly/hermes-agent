@@ -400,3 +400,53 @@ def test_a_real_tool_error_is_still_a_failure():
     assert _detect_tool_failure("read_file", real)[0] is True
     # The marker is only honoured as the literal boolean, never as truthy prose.
     assert classify_tool_failure("read_file", '{"error": "x", "guardrail_refusal": "yes"}')[0] is True
+
+
+def _memory_write_result(success, usage, **extra):
+    """Memory write result shaped like MemoryStore._success_response/_error."""
+    return json.dumps({"success": success, "done": success, "target": "memory",
+                       "usage": usage, **extra})
+
+
+def test_memory_net_zero_remove_does_not_reset_exact_failure_streak():
+    """Regression for the run-1855 guardrail gap: `memory` sits in
+    PROGRESS_RESET_TOOL_NAMES, so in an add-over-limit -> remove-success oscillation
+    every net-zero remove cleared the failing add's exact-failure streak and
+    repeated_exact_failure_block never armed. A memory write leaving capacity at a
+    value already seen this turn is the net-zero oscillation class, not progress;
+    the failing add's streak must survive it."""
+    ctrl = ToolCallGuardrailController(ToolCallGuardrailConfig(hard_stop_enabled=True))
+    add_args = {"action": "add", "target": "memory", "content": "x" * 200}
+    remove_args = {"action": "remove", "target": "memory", "old_text": "x"}
+    # The add lands at 95% (2,093/2,200) and seeds the capacity baseline.
+    seed = _memory_write_result(True, "95% — 2,093/2,200 chars")
+    assert ctrl.after_call(
+        "memory", {"action": "add", "target": "memory", "content": "seed"}, seed).allows_execution
+    fail_result = _memory_write_result(False, "95% — 2,093/2,200 chars", error="would exceed the limit")
+    remove_result = _memory_write_result(True, "94% — 2,086/2,200 chars", removed_entry="junk")
+    for _ in range(6):
+        assert ctrl.after_call("memory", add_args, fail_result, failed=True).allows_execution
+        assert ctrl.after_call("memory", remove_args, remove_result).allows_execution
+    decision = ctrl.before_call("memory", add_args)
+    assert decision.code == "repeated_exact_failure_block"
+
+
+def test_memory_real_progress_write_still_resets_exact_failure_streak():
+    """The guard must not over-tighten: a memory write that lands capacity at a value
+    NOT seen this turn (a genuine consolidation freeing new ground) still marks
+    progress and resets the streak, exactly as before."""
+    ctrl = ToolCallGuardrailController(ToolCallGuardrailConfig(hard_stop_enabled=True))
+    add_args = {"action": "add", "target": "memory", "content": "x" * 200}
+    assert ctrl.after_call(
+        "memory", add_args, _memory_write_result(False, "95% — 2,093/2,200 chars",
+                                                 error="would exceed the limit"),
+        failed=True).allows_execution
+    # Consolidation freed real ground: capacity drops to a fresh, unseen value.
+    consolidated = _memory_write_result(True, "70% — 1,540/2,200 chars", removed_entry="stale")
+    assert ctrl.after_call(
+        "memory", {"action": "remove", "target": "memory", "old_text": "stale"},
+        consolidated).allows_execution
+    assert ctrl.after_call("memory", add_args, _memory_write_result(
+        False, "70% — 1,540/2,200 chars", error="would exceed the limit"), failed=True).allows_execution
+    decision = ctrl.before_call("memory", add_args)
+    assert decision.action == "allow"  # one retry after real progress is a new experiment

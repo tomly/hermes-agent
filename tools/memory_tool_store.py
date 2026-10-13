@@ -96,6 +96,20 @@ class MemoryStore:
     # See #42405.
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
+    # Session-level oscillation breaker (run-1855 cmo death loop): with MEMORY.md near
+    # capacity the model ping-ponged add("x") -> remove("x") 543 times — every call
+    # SUCCEEDED, so the per-turn failure breaker never saw a failure and each success
+    # reset it. The capacity left by each persisted write is tracked; the same value
+    # recurring within a tight write window, _MAX_OSCILLATION_LAPS times, latches a
+    # terminal breaker for the rest of the session: writes that don't REDUCE capacity
+    # are refused without persisting, while consolidating writes still go through.
+    _MAX_OSCILLATION_LAPS = 5
+    _OSCILLATION_GAP_WRITES = 3
+    # At/above this fraction of the char limit, consolidation failures carry
+    # deterministic delete suggestions instead of leaving the model to improvise
+    # remove rounds that free less than the pending add needs (run-1855).
+    _SUGGESTION_CAPACITY_FRACTION = 0.9
+
     def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375, *,
                  memory_enabled: bool = True, user_profile_enabled: bool = True):
         self.memory_entries: List[str] = []
@@ -104,6 +118,10 @@ class MemoryStore:
         self.memory_enabled, self.user_profile_enabled = memory_enabled, user_profile_enabled
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
         self._consolidation_failures = 0  # per turn; reset by reset_consolidation_failures()
+        self._consolidation_deficit: Dict[str, int] = {}  # per target; chars a failed consolidation was short
+        self._capacity_marks: Dict[str, List[int]] = {}  # per target; capacity after each persisted write
+        self._capacity_revisits: Dict[str, Dict[int, Tuple[int, int]]] = {}  # per target; value -> (mark index, laps)
+        self._oscillation_latched: set = set()
 
     # Per-turn counter of failed at-capacity consolidation attempts; reset at each turn boundary by
     # reset_consolidation_failures() (#42405).
@@ -111,8 +129,10 @@ class MemoryStore:
         return self.user_profile_enabled if target == "user" else self.memory_enabled
 
     def reset_consolidation_failures(self) -> None:
-        """Call at turn start."""
+        """Call at turn start. Deliberately leaves the session-level oscillation breaker
+        alone — the run-1855 loop survived turn boundaries."""
         self._consolidation_failures = 0
+        self._consolidation_deficit = {}
 
     def _consolidation_failure(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """Count a consolidation failure: under the per-turn cap return ``response``
@@ -125,10 +145,77 @@ class MemoryStore:
         self._consolidation_failures += 1
         if self._consolidation_failures <= self._MAX_CONSOLIDATION_FAILURES_PER_TURN:
             return response
-        return {"success": False, "done": True, "error": (
+        terminal = {"success": False, "done": True, "error": (
             f"Memory consolidation failed {self._consolidation_failures} times this turn. Stop retrying "
             "memory calls — leave memory unchanged for now and continue with your reply to the user. "
             "The fact can be saved in a later turn.")}
+        # The deterministic delete targets survive the degrade: the terminal moment is
+        # exactly where the model most needs somewhere concrete to point (run-1855).
+        if suggestions := response.get("consolidation_suggestions"):
+            terminal["consolidation_suggestions"] = suggestions
+        return terminal
+
+    def _record_consolidation_deficit(self, target: str, shortage: int) -> None:
+        """Record how many chars over the limit a failed consolidation projected (latest
+        failure wins). A freeing write must cover this much before the per-turn failure
+        budget resets — otherwise a remove that frees less than the pending add needs
+        resets the budget every round and the add/remove loop never terminates (run-1855)."""
+        if shortage > 0:
+            self._consolidation_deficit[target] = shortage
+
+    def _settle_consolidation_progress(self, target: str, count_before: int, count_after: int) -> None:
+        """Per-turn failure-budget settlement for a PERSISTED write. Storing new content
+        resets the budget; freeing space resets it only once the freed amount covers the
+        shortage recorded at the last failed consolidation. A net-zero round — remove
+        handing back exactly what the last add freed — is not progress and keeps the
+        count climbing toward the cap (run-1855 breaker bypass)."""
+        if count_after > count_before or count_before - count_after >= self._consolidation_deficit.get(target, 0):
+            self._consolidation_deficit[target] = 0
+            self._consolidation_failures = 0
+
+    def _record_capacity_mark(self, target: str, count: int) -> None:
+        """Record the capacity a persisted write left, latching the session oscillation
+        breaker when the same value keeps recurring within a tight write window — the
+        all-success add/remove ping-pong where no failure counter ever moves (run-1855)."""
+        marks = self._capacity_marks.setdefault(target, [])
+        index = len(marks)
+        marks.append(count)
+        revisits = self._capacity_revisits.setdefault(target, {})
+        last_index, laps = revisits.get(count, (-1, 0))
+        laps = laps + 1 if 0 <= last_index < index and index - last_index <= self._OSCILLATION_GAP_WRITES else 1
+        revisits[count] = (index, laps)
+        if laps >= self._MAX_OSCILLATION_LAPS and target not in self._oscillation_latched:
+            self._oscillation_latched.add(target)
+            logger.warning("Memory %s capacity oscillated to %s chars %d times this session "
+                           "(net-zero add/remove cycle); refusing further capacity-raising "
+                           "memory writes this session.", self._path_for(target).name,
+                           f"{count:,}", laps)
+
+    def _consolidation_suggestions(self, target: str) -> List[str]:
+        """Deterministic consolidation targets for a near-full store: the 3 longest entries
+        as 1-based positions with estimated freed chars, so the model deletes concrete
+        entries instead of improvising remove rounds that free less than the add needs."""
+        entries = self._entries_for(target)
+        if self._char_count(target) <= self._SUGGESTION_CAPACITY_FRACTION * self._char_limit(target):
+            return []
+        longest = sorted(range(len(entries)), key=lambda i: len(entries[i]), reverse=True)[:3]
+        return [f"{i + 1}. (~{len(entries[i]) + len(ENTRY_DELIMITER)} chars) "
+                f"{entries[i][:80]}{'...' if len(entries[i]) > 80 else ''}"
+                for i in sorted(longest)]
+
+    def _oscillation_terminal(self, target: str) -> Dict[str, Any]:
+        """TERMINAL result once the oscillation breaker is latched: the write would raise
+        or hold capacity, so it is refused without persisting. Reducing writes still pass."""
+        response = _error(
+            f"Memory capacity on {self._path_for(target).name} has oscillated between the same "
+            f"values this session (net-zero add/remove cycles at {self._usage(target)}), so writes "
+            f"that do not reduce capacity are refused for the rest of this session. Stop retrying "
+            f"memory calls that add content — either apply one batch that removes or shortens "
+            f"stale entries to free real space, or leave memory unchanged and continue with your "
+            f"reply to the user.", done=True)
+        if suggestions := self._consolidation_suggestions(target):
+            response["consolidation_suggestions"] = suggestions
+        return response
 
     def load_from_disk(self):
         """Load MEMORY.md / USER.md and capture the frozen system-prompt snapshot.
@@ -232,8 +319,10 @@ class MemoryStore:
 
     def _failure_with_entries(self, target: str, message: str) -> Dict[str, Any]:
         """Consolidation failure carrying the live entries so the model can consolidate."""
-        return self._consolidation_failure(
-            _error(message, current_entries=self._entries_for(target), usage=self._usage(target)))
+        response = _error(message, current_entries=self._entries_for(target), usage=self._usage(target))
+        if suggestions := self._consolidation_suggestions(target):
+            response["consolidation_suggestions"] = suggestions
+        return self._consolidation_failure(response)
 
     def _batch_failure(self, target: str, message: str) -> Dict[str, Any]:
         """Batch-abort failure WITHOUT ``current_entries``: the store did not change and the
@@ -262,14 +351,20 @@ class MemoryStore:
             self._set_entries(target, list(dict.fromkeys(self._parse_entries(raw))))
             if bak:
                 return _drift_error(path, bak)
+            count_before = len(ENTRY_DELIMITER.join(self._entries_for(target)))
             result = mutate(self._entries_for(target), self._char_limit(target))
             if isinstance(result, dict):
                 return result
+            new_count = len(ENTRY_DELIMITER.join(result[0]))
+            if target in self._oscillation_latched and new_count >= count_before:
+                return self._oscillation_terminal(target)
             self._set_entries(target, result[0])
             from hermes_constants import mkdir_under_hermes_home
 
             mkdir_under_hermes_home(path.parent)
             self._write_file(path, result[0])
+            self._record_capacity_mark(target, new_count)
+            self._settle_consolidation_progress(target, count_before, new_count)
             extra_fields = result[2] if len(result) > 2 else {}
             return self._success_response(target, result[1], **extra_fields)
 
@@ -284,7 +379,9 @@ class MemoryStore:
         def _add(entries, limit):
             if content in entries:
                 return self._success_response(target, "Entry already exists (no duplicate added).")
-            if len(ENTRY_DELIMITER.join(entries + [content])) > limit:
+            projected = len(ENTRY_DELIMITER.join(entries + [content]))
+            if projected > limit:
+                self._record_consolidation_deficit(target, projected - limit)
                 return self._failure_with_entries(target, (
                     f"Memory at {self._char_count(target):,}/{limit:,} chars. Adding this entry "
                     f"({len(content)} chars) would exceed the limit. Consolidate now: use 'replace' to merge "
@@ -353,6 +450,7 @@ class MemoryStore:
                 return replaced, "Entry removed.", {"removed_entry": entries[idx]}
             new_total = len(ENTRY_DELIMITER.join(replaced))
             if new_total > limit:
+                self._record_consolidation_deficit(target, new_total - limit)
                 return self._failure_with_entries(target, (
                     f"Replacement would put memory at {new_total:,}/{limit:,} chars. Shorten the new content, "
                     f"or 'remove' other stale or less important entries to make room (see current_entries "
@@ -442,6 +540,7 @@ class MemoryStore:
                     f"final entry deliberately, use single remove() calls."))
             new_total = len(ENTRY_DELIMITER.join(working))  # budget check against the FINAL state only
             if new_total > limit:
+                self._record_consolidation_deficit(target, new_total - limit)
                 return self._batch_failure(target, (
                     f"After applying all {len(operations)} operations, memory would be at "
                     f"{new_total:,}/{limit:,} chars -- over the limit. Remove or shorten more "
@@ -467,13 +566,13 @@ class MemoryStore:
 
     def _success_response(self, target: str, message: str = None, **extra) -> Dict[str, Any]:
         """TERMINAL and WITHOUT the entries list: echoing entries invites the model to
-        "find more to fix" and re-issue the same ops. A successful write resets the
-        per-turn failure budget. ``**extra`` mirrors ``_error``'s convention — e.g. the
+        "find more to fix" and re-issue the same ops. The per-turn failure budget is NOT
+        reset here — a write that landed net-zero (dup add, remove undoing an add) used
+        to reset it forever and loop the turn; ``_mutate`` settles the budget via
+        ``_settle_consolidation_progress`` only for persisted writes that made real
+        progress (#42405, run-1855). ``**extra`` mirrors ``_error``'s convention — e.g. the
         full text a replace overwrote (#117952), deliberately visible despite the
         no-entries rule: silent data loss is the failure this field exists to prevent."""
-        # A successful write means the consolidation loop made progress, so the per-turn failure budget
-        # resets (the cap counts consecutive failures, not lifetime ones within a turn) (#42405).
-        self._consolidation_failures = 0
         return {"success": True, "done": True, "target": target,
                 "usage": self._usage_pct(target, self._char_count(target)),
                 "entry_count": len(self._entries_for(target)), **({"message": message} if message else {}),

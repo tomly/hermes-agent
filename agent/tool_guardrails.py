@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import deque
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Mapping
@@ -239,6 +240,24 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
     return (True, " [error]") if '"error"' in lower or '"failed"' in lower or result.startswith("Error") else (False, "")
 
 
+# Memory write results carry their store capacity in a usage string rendered by
+# MemoryStore._usage_pct ("<pct>% — <current>,/<limit>, chars"); the first group is
+# the live char count.
+_MEMORY_USAGE_CURRENT_RE = re.compile(r"([,\d]+)\s*/\s*[,\d]+\s*chars")
+
+
+def _memory_result_capacity(result: str | None) -> tuple[str, int] | None:
+    """``(target, capacity chars)`` from a memory write result's usage field, else None
+    (staged responses, foreign shapes) — None keeps legacy progress semantics."""
+    data = safe_json_loads(result or "")
+    if not isinstance(data, dict):
+        return None
+    match = _MEMORY_USAGE_CURRENT_RE.search(str(data.get("usage") or ""))
+    if match is None:
+        return None
+    return (str(data.get("target") or "memory"), int(match.group(1).replace(",", "")))
+
+
 # Guardrail verdict text injected into the conversation, keyed by decision code.
 # ``same_tool_failure_warning`` is built by _tool_failure_recovery_hint (tool-specific).
 _DECISION_MESSAGES: dict[str, str] = {
@@ -333,6 +352,9 @@ class ToolCallGuardrailController:
         self._call_history: deque[tuple[ToolCallSignature, str, bool]] = deque(maxlen=_STALL_GUARD_CYCLE_HISTORY)
         # tool_call_id -> spillover path, so a stub referencing a persisted-output preview can't dangle.
         self._persisted_result_paths: dict[str, str] = {}
+        # Capacities (target, chars) memory writes have left this turn, so a write that
+        # revisits one is the net-zero add/remove oscillation class, not progress.
+        self._memory_capacities_seen: set[tuple[str, int]] = set()
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
 
@@ -415,7 +437,7 @@ class ToolCallGuardrailController:
         self._same_tool_failure_counts.pop(tool_name, None)
         # A successful mutation is progress for every failing signature still counted
         # this turn. Pure loops never mutate between attempts, so the replay detector keeps its teeth.
-        if tool_name in PROGRESS_RESET_TOOL_NAMES or file_mutation_result_landed(tool_name, result):
+        if self._mutation_marks_progress(tool_name, result):
             self._progress_since_failure.update(dict.fromkeys(self._exact_failure_counts, True))
             self._same_tool_failure_counts.clear()
         if not self._is_idempotent(tool_name):
@@ -429,6 +451,26 @@ class ToolCallGuardrailController:
         if warnings and repeat_count >= self.config.no_progress_warn_after:
             return self._decide("warn", "idempotent_no_progress_warning", tool_name, repeat_count, signature)
         return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
+
+    def _mutation_marks_progress(self, tool_name: str, result: str | None) -> bool:
+        """Whether a successful mutating call marks progress for failing signatures.
+
+        A memory write whose resulting capacity was already seen this turn is the
+        add/remove oscillation class (a remove undoing an add at ~full capacity):
+        locally successful, jointly net-zero, so it must NOT clear the replay
+        detectors — the failing add's exact-failure streak has to survive it and arm
+        the block (run-1855: 543 such calls in one session). Any other mutating
+        success does mark progress.
+        """
+        if tool_name not in PROGRESS_RESET_TOOL_NAMES and not file_mutation_result_landed(tool_name, result):
+            return False
+        if tool_name == "memory":
+            capacity = _memory_result_capacity(result)
+            if capacity is not None:
+                if capacity in self._memory_capacities_seen:
+                    return False
+                self._memory_capacities_seen.add(capacity)
+        return True
 
     def _is_idempotent(self, tool_name: str) -> bool:
         return tool_name not in self.config.mutating_tools and tool_name in self.config.idempotent_tools
