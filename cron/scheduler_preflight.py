@@ -25,6 +25,10 @@ BLOCKED_CONFIG_MARKER = "[blocked_config]"
 BLOCKED_CONFIG_SILENT_MARKER = "[blocked_config:silent]"
 
 _TRANSIENT_NET_EXC_NAMES = frozenset({
+    # OpenAI/Anthropic SDK connection failures are not builtins and carry no errno; same name
+    # list as agent/error_classifier._TRANSPORT_ERROR_TYPES (APITimeoutError subclasses
+    # APIConnectionError in both SDKs).
+    "APIConnectionError", "APITimeoutError",
     "ConnectError", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout", "NetworkError",
     "TimeoutException", "ClientConnectorError", "ClientConnectorDNSError", "ServerTimeoutError",
     "ClientOSError"})
@@ -72,6 +76,12 @@ def _is_transient_provider_resolve_error(exc: BaseException) -> bool:
                 return True
         # Bare exceptions that carry the raw DNS text (format_runtime_provider_error).
         if any(needle in msg for needle in _DNS_FAILURE_NEEDLES):
+            return True
+        # The OpenAI/Anthropic SDK connection failure's own text is "Connection error." and the
+        # turn terminal path flattens it to RuntimeError(str(error)) on the way here
+        # (cron.scheduler._final_response_from_result), leaving only the message. Exact match,
+        # never a needle: an error that merely mentions the phrase is not a transport failure.
+        if msg.strip().rstrip(".").strip() == "connection error":
             return True
         cur = cur.__cause__ or cur.__context__
     return False

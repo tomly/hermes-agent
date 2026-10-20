@@ -2071,7 +2071,8 @@ def _run_agent_with_watchdog(
     return result
 
 
-def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgent) -> str:
+def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgent,
+                                agent=None) -> str:
     """Deliverable final response from a ``run_conversation`` result. Raises RuntimeError on
     `failed=True`/`completed=False`: the error text may sit in `final_response` and would otherwise
     be delivered as the reply with the job marked ok."""
@@ -2084,6 +2085,14 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
     final_response_text = (result.get("final_response") or "").strip()
     max_iteration_summary = is_max_iteration_handoff(result)
     if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
+        # Chain the turn's typed API error when the terminal paths kept it
+        # (agent._terminal_api_error): run_job's unreachable-model classification walks
+        # __cause__, and a bare RuntimeError("Connection error.") alone reads as non-transient
+        # (2026-10-20 arxiv-agent-daily gap).
+        _cause = getattr(agent, "_terminal_api_error", None)
+        if isinstance(_cause, BaseException):
+            raise RuntimeError(
+                result.get("error") or final_response_text or "agent reported failure") from _cause
         raise RuntimeError(result.get("error") or final_response_text or "agent reported failure")
     if max_iteration_summary:
         logger.warning(
@@ -2621,7 +2630,7 @@ def run_job(
         result = _run_agent_with_watchdog(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
             worker_state=_worker_state)
-        final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
+        final_response = _final_response_from_result(result, job_id, job_name, AIAgent, agent=agent)
         if (setup.fallback_notice and final_response.strip() and not _is_cron_silence_response(final_response)
                 and _cron_failure_marker_error(final_response) is None):
             # Pre-agent provider switch (#74349) rides with the delivered report; silence and the

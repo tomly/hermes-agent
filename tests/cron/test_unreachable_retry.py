@@ -7,7 +7,9 @@ ladder never fires past its last rung.
 """
 
 from datetime import datetime, timedelta, timezone, UTC
+from types import SimpleNamespace
 
+import openai
 import pytest
 
 import cron.scheduler as sched
@@ -75,6 +77,63 @@ def test_unreachable_failure_pulls_next_run_earlier_then_ladder_exhausts(
     save_jobs(jobs)
     monkeypatch.setattr("cron.jobs._hermes_now", lambda: retry_at + timedelta(seconds=1))
     assert weekly["id"] not in {due["id"] for due in get_due_jobs()}
+
+
+def test_flattened_connection_error_is_unreachable_and_parks_ladder(tmp_cron_home):
+    """2026-10-20 arxiv-agent-daily gap: a model-gateway blip surfaces to the scheduler as a
+    bare ``RuntimeError("Connection error.")`` — the turn terminal path flattens the OpenAI
+    SDK's ``APIConnectionError`` to its message text (cron.scheduler
+    ``_final_response_from_result``). That shape classified as NOT transient, so no re-run
+    ladder was parked and the daily report was lost for the day. Locks: the flattened text,
+    the typed SDK exception and a chained cause are all unreachable failures at zero API
+    calls; any API spend is not; lookalike business text is not; and the classified failure
+    parks the 300/900/1800s ladder."""
+    zero_spend = SimpleNamespace(session_api_calls=0)
+    spent = SimpleNamespace(session_api_calls=3)
+
+    typed = openai.APIConnectionError(request=None)
+    flattened = RuntimeError("Connection error.")
+    chained = RuntimeError("Connection error.")
+    chained.__cause__ = openai.APIConnectionError(request=None)
+    for exc in (typed, flattened, chained):
+        assert ur.is_model_unreachable_failure(exc, zero_spend) is True, type(exc).__name__
+        assert ur.is_model_unreachable_failure(exc, spent) is False, "API calls were made"
+        assert ur.is_model_unreachable_failure(exc) is True
+    # The exact-match rule must not sweep errors that merely mention the phrase.
+    assert ur.is_model_unreachable_failure(
+        RuntimeError("upstream rejected the request: Connection error header missing")) is False
+
+    # The classified failure drives the real bookkeeping ladder (5/15/30 min).
+    job_id = create_job("arxiv daily", "every 24h")["id"]
+    now = datetime.now(UTC)
+    for i, delay in enumerate(ur.RETRY_DELAYS_SECONDS):
+        assert ur.is_model_unreachable_failure(flattened, zero_spend)
+        assert mark_job_run(job_id, False, "RuntimeError: Connection error.",
+                            model_unreachable=True)
+        j = get_job(job_id)
+        nxt = datetime.fromisoformat(j["next_run_at"])
+        assert timedelta(0) < nxt - now <= timedelta(seconds=delay + 120), (
+            f"attempt {i}: expected retry ~{delay}s out, got {nxt - now}")
+        assert j[ur.STATE_KEY]["attempt"] == i + 1
+
+
+def test_final_response_raise_chains_the_typed_api_error():
+    """The cron flatten point must keep the turn's typed exception reachable as ``__cause__``:
+    the unreachable-model classifier walks the cause chain, so a bare RuntimeError with only
+    the message text (this file's 2026-10-20 defect) reads as a permanent failure."""
+    from cron.scheduler import _final_response_from_result
+
+    cause = RuntimeError("sentinel: original typed error")
+    agent = SimpleNamespace(_terminal_api_error=cause)
+    with pytest.raises(RuntimeError) as exc_info:
+        _final_response_from_result(
+            {"failed": True, "error": "Connection error."}, "job", "job", object, agent=agent)
+    assert exc_info.value.__cause__ is cause
+
+    # No stamped exception (older agents, non-turn failures): plain raise, no suppression.
+    with pytest.raises(RuntimeError) as plain:
+        _final_response_from_result({"failed": True, "error": "boom"}, "job", "job", object)
+    assert plain.value.__cause__ is None and plain.value.__suppress_context__ is False
 
 
 def test_will_retry_mirrors_plan_retry_yield(tmp_cron_home):
