@@ -551,6 +551,7 @@ def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home):
         assert kbd.check_respawn_guard(conn, spawn_failed_id) == "blocker_auth"
 
 
+@pytest.mark.platforms("linux")
 def test_infrastructure_spawn_refusal_never_charges_the_card(
     kanban_home, monkeypatch, all_assignees_spawnable,
 ):
@@ -1007,6 +1008,171 @@ def test_symlinked_workspaces_root_does_not_widen_scratch_cleanup(kanban_home, t
         kbw.set_workspace_path(conn, t, victim)
         assert kb.complete_task(conn, t, result="done")
     assert (victim / "keep.txt").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Populated-scratch preserve-to-archive disposal (#1291)
+# ---------------------------------------------------------------------------
+
+
+
+def test_completion_archives_undeclared_scratch_files(kanban_home):
+    """Regression for #1291: scratch cleanup used to ``rmtree`` the whole tree,
+    destroying work the declared-artifacts channel never captured (over-cap
+    videos, keyframe dirs, deliverables referenced by path from downstream
+    cards). A populated scratch workspace must be MOVED to the board's
+    ``workspaces-archive`` with a ``scratch_workspace_archived`` event naming
+    the new path — the undeclared file must survive completion."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="campaign final cut")
+        task = kb.get_task(conn, t)
+        ws = kbw.resolve_workspace(task)
+        kbw.set_workspace_path(conn, t, ws)
+        final_dir = ws / "campaign" / "final"
+        final_dir.mkdir(parents=True)
+        (final_dir / "candidate_1.mp4").write_bytes(b"video-bytes")
+        (final_dir / "keyframes").mkdir()
+        (final_dir / "keyframes" / "kf_01.png").write_bytes(b"png")
+
+        assert kb.complete_task(conn, t, result="ok", summary="delivered")
+
+        kinds = [e.kind for e in kb.list_events(conn, t)]
+        archived = [e for e in kb.list_events(conn, t)
+                    if e.kind == "scratch_workspace_archived"]
+
+    assert not ws.exists(), "workspace must leave the live workspaces root"
+    archive_root = kb.workspaces_archive_root()
+    moved = archive_root / t
+    assert (moved / "campaign" / "final" / "candidate_1.mp4").read_bytes() == b"video-bytes"
+    assert (moved / "campaign" / "final" / "keyframes" / "kf_01.png").read_bytes() == b"png"
+    assert len(archived) == 1
+    assert archived[0].payload["path"] == str(moved)
+    assert archived[0].payload["bytes"] > 0
+    assert "scratch_workspace_archived" in kinds
+
+
+def test_oversized_declared_artifact_survives_retry_completion(kanban_home):
+    """Regression for #1291's exact production sequence: a declared artifact
+    over the 25 MB attachment cap makes ``complete_task`` raise
+    ``ArtifactPreservationError`` and roll back; the worker retries WITHOUT the
+    declaration and the completion then rmtree'd the file. The video must
+    survive the retry's cleanup via the archive instead."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="delivery zip")
+        task = kb.get_task(conn, t)
+        ws = kbw.resolve_workspace(task)
+        kbw.set_workspace_path(conn, t, ws)
+        big = ws / "YouSpeak-CN-campaign-delivery.zip"
+        with big.open("wb") as f:
+            f.seek(kb.KANBAN_ATTACHMENT_MAX_BYTES)  # sparse: 25MB + 1 byte
+            f.write(b"\0")
+
+        with pytest.raises(kb.ArtifactPreservationError):
+            kb.complete_task(conn, t, result="ok", metadata={"artifacts": [str(big)]})
+        status_before = kb.get_task(conn, t).status
+        assert status_before in ("ready", "running"), (
+            "the failed preservation must roll the completion back"
+        )
+
+        assert kb.complete_task(conn, t, result="ok", summary="retry without artifacts")
+        assert kb.get_task(conn, t).status == "done"
+
+    assert not ws.exists()
+    moved_zip = kb.workspaces_archive_root() / t / big.name
+    assert moved_zip.is_file(), "oversized deliverable must be archived"
+    assert moved_zip.stat().st_size == kb.KANBAN_ATTACHMENT_MAX_BYTES + 1
+
+
+def test_archive_move_failure_preserves_workspace_in_place(kanban_home):
+    """When the archive move fails (here: a file blocks the archive root), the
+    workspace must be kept IN PLACE with an ``unarchived_scratch_files`` event
+    — cleanup may never fall back to deleting work it could not preserve."""
+    archive_root = kb.workspaces_archive_root()
+    archive_root.parent.mkdir(parents=True, exist_ok=True)
+    archive_root.write_text("not a directory")  # mkdir inside the move raises
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="blocked archive")
+        task = kb.get_task(conn, t)
+        ws = kbw.resolve_workspace(task)
+        kbw.set_workspace_path(conn, t, ws)
+        (ws / "final.mp4").write_bytes(b"video")
+
+        assert kb.complete_task(conn, t, result="ok")
+
+        unarchived = [e for e in kb.list_events(conn, t)
+                      if e.kind == "unarchived_scratch_files"]
+    assert ws.is_dir() and (ws / "final.mp4").read_bytes() == b"video"
+    assert len(unarchived) == 1
+    assert unarchived[0].payload["path"] == str(ws)
+
+
+def test_empty_scratch_workspace_is_still_deleted(kanban_home):
+    """The preserve-to-archive disposal keeps the old contract for empty trees:
+    nothing to lose means nothing to keep."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="empty scratch")
+        task = kb.get_task(conn, t)
+        ws = kbw.resolve_workspace(task)
+        kbw.set_workspace_path(conn, t, ws)
+        assert kb.complete_task(conn, t, result="ok")
+        kinds = [e.kind for e in kb.list_events(conn, t)]
+    assert not ws.exists()
+    assert not (kb.workspaces_archive_root() / t).exists()
+    assert "scratch_workspace_archived" not in kinds
+
+
+def test_prune_workspaces_archive_enforces_retention_and_capacity(kanban_home, monkeypatch):
+    """The archive guarantee is bounded: trees past the retention window are
+    dropped, and beyond the capacity cap the OLDEST survivors are evicted
+    first."""
+    import time as _time
+
+    archive_root = kb.workspaces_archive_root()
+    archive_root.mkdir(parents=True, exist_ok=True)
+    now = _time.time()
+    old = archive_root / "t_oldddddd"
+    old.mkdir()
+    (old / "f.bin").write_bytes(b"o" * 10)
+    os.utime(old, (now - 20 * 24 * 3600, now - 20 * 24 * 3600))
+    fresh_a = archive_root / "t_freshaaaa"
+    fresh_a.mkdir()
+    (fresh_a / "f.bin").write_bytes(b"a" * 80)
+    os.utime(fresh_a, (now - 100, now - 100))
+    fresh_b = archive_root / "t_freshbbbb"
+    fresh_b.mkdir()
+    (fresh_b / "f.bin").write_bytes(b"b" * 80)
+
+    monkeypatch.setattr(kbw, "WORKSPACES_ARCHIVE_MAX_TOTAL_BYTES", 100)
+
+    kbw._prune_workspaces_archive(archive_root, now=now)
+
+    assert not old.exists(), "past the retention window must be pruned"
+    assert not fresh_a.exists(), "capacity overflow evicts the OLDEST survivor first"
+    assert fresh_b.exists()
+    assert (fresh_b / "f.bin").read_bytes() == b"b" * 80
+
+
+def test_copy_capped_refuses_truncated_copy(kanban_home, monkeypatch, tmp_path):
+    """A staged completion attachment must equal its source in length: when the
+    source shrinks mid-copy the short copy must roll the completion back
+    (ArtifactPreservationError), never silently register a corrupt deliverable
+    (the 18-byte corrupted-attachment class of #1291)."""
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"x" * 128)
+    dest = tmp_path / "clip_copy.mp4"
+    real_stat = Path.stat
+
+    def lying_stat(self, *args, **kwargs):
+        st = real_stat(self, *args, **kwargs)
+        if self == src:
+            fields = list(st)
+            fields[6] = st.st_size + 64  # st_size lies high; the copy falls short
+            st = os.stat_result(fields)
+        return st
+
+    monkeypatch.setattr(Path, "stat", lying_stat)
+    with pytest.raises(kb.ArtifactPreservationError, match="truncated"):
+        kb._copy_capped(src, dest, str(src))
 
 
 # ---------------------------------------------------------------------------
@@ -1667,6 +1833,61 @@ def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monk
         kbd._default_spawn(task, str(tmp_path / "ws"))
         assert captured["cmd"][-3:] == [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
         assert captured["env"]["PYTHONPATH"].split(os.pathsep)[0] == root
+
+
+def test_resolve_hermes_argv_injected_runtime_falls_back_to_path(monkeypatch, tmp_path):
+    """Regression (fleet incident 2026-10-01 — the corrected root cause of
+    #1243's symptom): a gateway launched by a bare interpreter via ``python -c``
+    plus an in-script ``sys.path.insert`` imports ``hermes_cli`` only through
+    that runtime injection; its site-packages has no hermes, the spawned worker
+    starts with clean interpreter state (cwd = task workspace, Hermes-owned
+    PYTHONPATH entries stripped from the spawn env), so every worker died with
+    ``ModuleNotFoundError: No module named 'hermes_cli'`` until the respawn
+    breaker parked the cards as ``blocked``. In that runtime shape the resolver
+    must fall back to the ``hermes`` wrapper on PATH (the wrapper carries its
+    own path injection); when the process cwd IS the package root (``python -m``
+    / pytest from the checkout), the module form must keep winning over a
+    planted PATH shim (#111569) — ``find_spec`` hitting is no longer the whole
+    viability question, only half of it."""
+    import importlib.util
+    import shutil
+    from types import SimpleNamespace
+
+    from hermes_cli import install_shape
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    injected_root = tmp_path / "hermes-agent"
+    package_dir = injected_root / "hermes_cli"
+    package_dir.mkdir(parents=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+
+    def fake_find_spec(name, *args, **kwargs):
+        if name == "hermes_cli":
+            return SimpleNamespace(
+                origin=str(package_dir / "__init__.py"),
+                submodule_search_locations=None,
+            )
+        return None
+
+    # Hermetic against ambient environments (editable venvs) whose site dirs DO
+    # serve hermes: the gateway-under-test sees an interpreter that serves none.
+    empty_site = tmp_path / "site-packages"
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+    monkeypatch.setattr(install_shape, "_interpreter_package_roots", lambda: [empty_site])
+    monkeypatch.delenv("HERMES_BIN", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda name: "/opt/hermes/bin/hermes")
+    monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/opt/hermes/bin/hermes")
+
+    # cwd is neither the package root nor served: the injected-runtime shape.
+    monkeypatch.chdir(tmp_path)
+    assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"], (
+        "a sys.path-injected runtime must not hand workers a module argv their "
+        "interpreter cannot import"
+    )
+
+    # Source-tree launch (cwd serves the package): module form stays first.
+    monkeypatch.chdir(injected_root)
+    assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
 
 
 # ---------------------------------------------------------------------------
