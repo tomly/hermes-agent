@@ -1099,6 +1099,10 @@ def nonretryable_client_error_result(
         _final_response, _nonretryable_summary, delivered,
     )
     result = _failed_turn_result(_final_response, messages, api_call_count, _nonretryable_summary)
+    # The cron caller re-raises only result["error"]'s text (cron.scheduler
+    # _final_response_from_result); keep the typed exception so that raise can chain it and the
+    # scheduler's transient-network classification can walk the cause chain.
+    agent._terminal_api_error = api_error
     result.update({
         "failure_reason": classified.reason.value,
         "failure_retryable": bool(classified.retryable),
@@ -1232,6 +1236,8 @@ def max_retries_exhausted_result(
             "smaller sections (or via execute_code with Python's open())."
         )
     result = _failed_turn_result(_final_response, messages, api_call_count, _final_summary)
+    # Same chain-preservation stamp as nonretryable_client_error_result above.
+    agent._terminal_api_error = api_error
     result.update({
         # Classified reason so callers (kanban worker in cli.py) can tell a quota wall
         # (``rate_limit`` / ``billing``) from a task failure.
