@@ -2375,8 +2375,8 @@ def _advance_after_run(job: dict[str, Any], now: str, *, ladder_rung: bool = Fal
     """Bump ``repeat.completed`` and recompute ``next_run_at``; retire the record as a terminal
     completion when the repeat limit is reached or a one-shot has no further run.
 
-    ``ladder_rung``: this run re-ran an occurrence that already counted (an unreachable-model
-    re-run, ``cron.unreachable_retry.is_retry_run``), so ``repeat.completed`` is left as is."""
+    ``ladder_rung``: this run re-ran an occurrence that already counted (a ladder re-run,
+    ``cron.unreachable_retry.is_retry_run``), so ``repeat.completed`` is left as is."""
     # If no next run, decide whether this is terminal completion (one-shot) or a transient failure
     # (recurring schedule couldn't compute — e.g. 'croniter' missing from the runtime env). Recurring jobs
     # must NEVER be silently disabled: that turns a missing runtime dep into "job completed" and the user's
@@ -2432,6 +2432,7 @@ def mark_job_run(
     expected_fire_owner: Optional[str] = None,
     execution_id: Optional[str] = None,
     model_unreachable: bool = False,
+    interrupted: bool = False,
     ladder_rung: bool = False,
     quota_hold_seconds: Optional[float] = None,
     recover_consumed_fire: bool = False,
@@ -2447,9 +2448,12 @@ def mark_job_run(
     ``model_unreachable``: this failed run never reached the model (transient network/DNS error,
     zero API calls). Recurring jobs then get a bounded automatic re-run — ``next_run_at`` is pulled
     earlier per ``cron.unreachable_retry.RETRY_DELAYS_SECONDS`` — instead of waiting a full period
-    (Cowork-style; see cron/unreachable_retry.py). ``ladder_rung``: this run IS one of those
-    re-runs (``is_retry_run``); its occurrence already counted, so ``repeat.completed`` is not
-    bumped again.
+    (Cowork-style; see cron/unreachable_retry.py). ``interrupted``: the run reached the model and
+    was then killed mid-flight (inactivity/runtime-limit watchdog, gateway shutdown — Bug 1468);
+    the occurrence was already consumed by the dispatch-time advance, so the same bounded ladder
+    compensates with a re-run instead of leaving e.g. a daily report permanently missing.
+    ``ladder_rung``: this run IS one of those re-runs (``is_retry_run``); its occurrence already
+    counted, so ``repeat.completed`` is not bumped again.
 
     ``quota_hold_seconds``: the provider said it stays closed for this long (a quota 429 with
     ``retry after <N>s``). Recurring jobs are parked through the window instead of re-firing into
@@ -2478,6 +2482,10 @@ def mark_job_run(
 
         if not success and model_unreachable and not is_terminal_job(job):
             plan_retry(job)
+        elif not success and interrupted and not is_terminal_job(job):
+            # Killed mid-flight (Bug 1468): the occurrence is consumed either way, so
+            # compensate with the same bounded ladder instead of leaving the slot lost.
+            plan_retry(job, interrupted=True)
         else:
             # Any run that reached the model (either outcome) resets the re-run ladder.
             clear_state(job)

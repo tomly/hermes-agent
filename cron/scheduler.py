@@ -1161,7 +1161,7 @@ def mark_running_jobs_interrupted(
         try:
             with use_cron_store(profile_home):
                 if mark_job_run(
-                    job_id, False, reason, expected_fire_owner=fire_owner):
+                    job_id, False, reason, expected_fire_owner=fire_owner, interrupted=True):
                     marked.append(job_id)
         except Exception as e:
             logger.warning("Failed to mark job %s interrupted: %s", job_id, e)
@@ -2130,9 +2130,13 @@ def _run_agent_with_watchdog(
     # The watchdog can flag a limit in the same poll the future settled: a finished run is the
     # truth, so only an UNSETTLED future may be declared timed out.
     if _timed_out_reason == "runtime_limit" and not _cron_future.done():
+        # Stamp before raising: the kill consumed the occurrence (dispatch already advanced
+        # next_run_at), so the bookkeeping tail must compensate with a bounded re-run (Bug 1468).
+        job["_interrupted_retry"] = True
         _raise_runtime_limit_timeout(
             agent, job_name, float(_cron_wall_limit), time.monotonic() - _run_started_mono)
     if _timed_out_reason == "inactivity" and not _cron_future.done():
+        job["_interrupted_retry"] = True
         _raise_inactivity_timeout(agent, job_name, _cron_inactivity_limit)
 
     if not isinstance(result, dict):
@@ -3175,13 +3179,14 @@ def _save_compose_deliver(
         output_file=output_file, agent_declared=d.agent_declared)
     # Whitespace-only == empty: skip delivery; the guard below marks it a soft failure.
     d.should_deliver = bool(deliver_content.strip()) and not _silent_alert
-    if d.should_deliver and not d.success and job.get("_model_unreachable"):
-        # The model was never reached and a bounded automatic re-run will be scheduled
-        # (cron/unreachable_retry.py): hold the failure notice — the re-run either
-        # delivers the real result or, once the ladder is exhausted, the next failure
-        # alerts normally. Mirrors Cowork's silent 5/15/30-minute re-runs.
+    if d.should_deliver and not d.success and (
+            job.get("_model_unreachable") or job.get("_interrupted_retry")):
+        # The model was never reached, or the run was killed mid-flight, and a bounded
+        # automatic re-run will be scheduled (cron/unreachable_retry.py): hold the failure
+        # notice — the re-run either delivers the real result or, once the ladder is
+        # exhausted, the next failure alerts normally. Mirrors Cowork's silent re-runs.
         from cron.unreachable_retry import will_retry
-        if will_retry(job):
+        if will_retry(job, interrupted=bool(job.get("_interrupted_retry"))):
             d.should_deliver = False
             logger.info(
                 "Job '%s': suppressing failure notice — automatic re-run pending", job["id"])
