@@ -30,6 +30,15 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   the last-resort breaker: hard-interrupt, fail the run with the limit named. It derives from the
   same bound the stale-claim sweep uses so the owner ends itself no later than the outside world
   would disown it.
+- **A killed occurrence is compensated, not silently consumed** (`cron/unreachable_retry.py`,
+  `plan_retry(job, interrupted=True)`): a run killed mid-flight — by the inactivity/runtime-limit
+  watchdog or by `mark_running_jobs_interrupted` at gateway shutdown — has its occurrence already
+  spent (the tick advanced `next_run_at` before dispatch), so the same bounded 5/15/30-minute
+  ladder the unreachable-model class uses re-runs it instead of leaving e.g. a daily report
+  permanently missing (Bug 1468: the kill was recorded, the 10-21 report never was). Not
+  spend-neutral, so a separate gate (`cron.retry_interrupted`, default on); one shared ladder
+  state caps compensations per failure streak, re-runs never double-count `repeat.completed`
+  (`ladder_rung`), and one-shot jobs are never resurrected.
 - Catch-up window = half the period, clamped to 120s–2h; 120s grace for missed one-shots.
 - Every recurring occurrence is accounted for: `tick()` advances `next_run_at` BEFORE dispatch
   (at-most-once across a mid-run crash) and stamps `pending_slot` in the same save; a scan that

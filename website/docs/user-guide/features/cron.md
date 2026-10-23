@@ -503,6 +503,33 @@ cron:
   retry_unreachable: false   # default true; disables the automatic re-runs
 ```
 
+### Compensation re-runs for killed runs
+
+The mirror case: the run reached the model and was working, then got killed
+mid-flight — by the inactivity budget, by the wall-clock run-time limit
+above, or by a gateway restart. The kill is recorded, but the occurrence it
+was killed out of was already spent (the scheduler advances the schedule
+before dispatch so a crashed run cannot double-fire), which is how a daily
+report job can end up with a permanently missing day: the failure is on the
+record and the report still does not exist.
+
+Killed runs of recurring jobs are therefore **compensated on the same 5, 15,
+30-minute ladder**: a re-run starts a few minutes later, when the transient
+condition (a wedged broker connection, a restarting gateway) has usually
+cleared, and either produces the missing output or fails normally. Unlike the
+unreachable-model re-runs this is not spend-neutral — the first run already
+spent tokens — so it has its own switch, and the ladder cap (three re-runs
+per failure streak, shared with the unreachable class) bounds the extra
+spend. The accounting is identical: re-runs never count toward a job's
+`repeat` limit, one-shot jobs are never resurrected, interim failure notices
+are held while a re-run is pending, and the ladder never fires past the
+schedule's own next occurrence.
+
+```yaml
+cron:
+  retry_interrupted: false   # default true; disables compensation re-runs
+```
+
 ### Holding a job through a closed provider usage window
 
 The mirror case: the provider says exactly how long it will stay closed. When
