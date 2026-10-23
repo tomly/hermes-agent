@@ -1208,6 +1208,41 @@ def _cron_inactivity_seconds() -> float:
         return 600.0
 
 
+def _cron_wall_clock_seconds() -> Optional[float]:
+    """Task-level wall-clock cap for one cron run, or ``None`` = unlimited.
+
+    ``cron.max_run_seconds`` (config.yaml) wins: positive = the cap, 0/negative = unlimited.
+    Without it the cap DERIVES from the ledger's stale-claim bound (``cron/executions.py``:
+    ``max(3 × HERMES_CRON_TIMEOUT, script timeout, 7200)``), so a run cannot outlive the moment
+    another process would declare its claim wedged; when even that bound is unlimited
+    (``HERMES_CRON_TIMEOUT=0``) the operator opted out of every bound and so is ``None`` here.
+
+    Why a wall clock at all: the inactivity watchdog is fed by activity heartbeats from the very
+    paths that can hang — ``sequential tool running (Ns)``, ``waiting for provider response`` —
+    so a run wedged inside one tool/provider call (Bug 1468: the ibkr-paper post-market run stuck
+    on a dead broker for 2h13m until an external restart) never looks idle and nothing interrupts
+    it. This cap is the last-resort breaker that bounds ANY hang.
+    """
+    try:
+        cfg = load_config() or {}
+    except Exception:
+        logger.debug("cron.max_run_seconds: config read failed; using the derived bound",
+                     exc_info=True)
+        cfg = {}
+    cron_cfg = cfg.get("cron") if isinstance(cfg, dict) else None
+    raw = cron_cfg.get("max_run_seconds") if isinstance(cron_cfg, dict) else None
+    if raw is not None:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            logger.warning("Invalid cron.max_run_seconds=%r; ignoring", raw)
+        else:
+            return value if value > 0 else None
+    from cron.executions import _live_owner_stale_after_seconds
+
+    return _live_owner_stale_after_seconds()
+
+
 def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
     """Return (or create) the persistent parallel pool for the ACTIVE profile.
 
@@ -1954,14 +1989,41 @@ def _raise_inactivity_timeout(agent, job_name: str, limit_s: float) -> None:
         f"— last activity: {_last_desc}")
 
 
+def _raise_runtime_limit_timeout(agent, job_name: str, limit_s: float, ran_s: float) -> None:
+    """Hard-interrupt a run that outlived the task-level wall-clock cap and raise TimeoutError.
+
+    Distinct from the inactivity kill: the run may have been heartbeating activity the whole time
+    (a wedged tool/provider wait), so the copy names the wall clock and the config knob that
+    tunes it, not idleness."""
+    _activity = {}
+    if hasattr(agent, "get_activity_summary"):
+        with contextlib.suppress(Exception):
+            _activity = agent.get_activity_summary()
+    logger.error(
+        "Job '%s' ran %.0fs (wall-clock limit %.0fs, cron.max_run_seconds) — hard-interrupting "
+        "| iteration=%s/%s | tool=%s",
+        job_name, ran_s, limit_s,
+        _activity.get("api_call_count", 0), _activity.get("max_iterations", 0),
+        _activity.get("current_tool") or "none")
+    request_hard_interrupt(agent, "Cron job runtime limit exceeded", tool_reason="cron runtime-limit watchdog")
+    raise TimeoutError(
+        f"Cron job '{job_name}' exceeded its {int(limit_s)}s wall-clock runtime limit "
+        f"(cron.max_run_seconds) after {int(ran_s)}s — hard-interrupted")
+
+
 def _run_agent_with_watchdog(
     agent, prompt: str, job: dict, job_id: str, job_name: str, task_id: str, cancel_event,
     worker_state: Optional[dict] = None,
 ) -> dict:
     """Run ``agent.run_conversation`` on a worker thread under the inactivity (not wall-clock)
-    watchdog: default 600s, override HERMES_CRON_TIMEOUT, 0 = unlimited."""
+    watchdog: default 600s, override HERMES_CRON_TIMEOUT, 0 = unlimited. A task-level wall-clock
+    cap (``cron.max_run_seconds``, else the ledger's derived stale bound) backstops it: the wait
+    paths that can hang heartbeat activity while blocked, so a wedged run never looks idle and
+    only this cap ends it (Bug 1468)."""
     _cron_timeout = _cron_inactivity_seconds()
     _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
+    _cron_wall_limit = _cron_wall_clock_seconds()
+    _run_started_mono = time.monotonic()
     _POLL_INTERVAL = 5.0
     # Heartbeat the one-shot run_claim while alive: without it a long run looks like a dead owner
     # and gets re-dispatched / stale-removed out from under the live run.
@@ -2005,7 +2067,8 @@ def _run_agent_with_watchdog(
         _cron_context.run, agent.run_conversation, prompt, task_id=task_id)
     if worker_state is not None:
         worker_state["future"] = _cron_future
-    _inactivity_timeout = False
+    _timed_out_reason: Optional[str] = None
+    _watch_verdict: dict = {}
     _watch_stop = threading.Event()
 
     def _idle_seconds() -> float:
@@ -2018,13 +2081,16 @@ def _run_agent_with_watchdog(
             return 0.0
 
     def _watch_inactivity() -> None:
-        nonlocal _inactivity_timeout
-        if _cron_inactivity_limit is None:
+        nonlocal _timed_out_reason
+        if _cron_inactivity_limit is None and _cron_wall_limit is None:
             return
         if _inactivity_watchdog_loop(
-            get_idle_seconds=_idle_seconds, limit_s=_cron_inactivity_limit, poll_s=_POLL_INTERVAL,
-            stop=_watch_stop, future_done=_cron_future.done, meter=_awake_idle):
-            _inactivity_timeout = True
+            get_idle_seconds=_idle_seconds,
+            limit_s=_cron_inactivity_limit if _cron_inactivity_limit is not None else float("inf"),
+            poll_s=_POLL_INTERVAL,
+            stop=_watch_stop, future_done=_cron_future.done, meter=_awake_idle,
+            wall_limit_s=_cron_wall_limit, verdict=_watch_verdict):
+            _timed_out_reason = _watch_verdict.get("reason") or "inactivity"
 
     _watch_thread = threading.Thread(
         target=_watch_inactivity, name=f"cron-inactivity-{str(job_id)[:8]}", daemon=True)
@@ -2033,13 +2099,13 @@ def _run_agent_with_watchdog(
         str(job.get("execution_id") or ""), job_name, idle_seconds=_idle_seconds,
         every_seconds=_RUN_CLAIM_HEARTBEAT_SECONDS)
     try:
-        if _cron_inactivity_limit is not None:
+        if _cron_inactivity_limit is not None or _cron_wall_limit is not None:
             # Separate daemon thread so a hung get_activity_summary can't stop the limit firing.
             # Daemon thread: kernel ``Event.wait`` timeout, independent of the ``run_job`` thread. A blocked
             # loop / hung ``get_activity_summary`` on this thread can no longer keep the 600s inactivity
             # limit from firing (#94285).
             _watch_thread.start()
-        if _cron_inactivity_limit is None and not _is_oneshot and cancel_event is None:
+        if _cron_inactivity_limit is None and _cron_wall_limit is None and not _is_oneshot and cancel_event is None:
             result = _cron_future.result()
         else:
             result = None
@@ -2049,7 +2115,7 @@ def _run_agent_with_watchdog(
                     _abort_if_fire_claim_lost()
                     result = _cron_future.result()
                     break
-                if _inactivity_timeout:
+                if _timed_out_reason is not None:
                     break
                 _abort_if_fire_claim_lost()
                 _heartbeat_run_claim_if_due()
@@ -2061,7 +2127,12 @@ def _run_agent_with_watchdog(
         _watch_stop.set()
         _cron_pool.shutdown(wait=False, cancel_futures=True)
 
-    if _inactivity_timeout:
+    # The watchdog can flag a limit in the same poll the future settled: a finished run is the
+    # truth, so only an UNSETTLED future may be declared timed out.
+    if _timed_out_reason == "runtime_limit" and not _cron_future.done():
+        _raise_runtime_limit_timeout(
+            agent, job_name, float(_cron_wall_limit), time.monotonic() - _run_started_mono)
+    if _timed_out_reason == "inactivity" and not _cron_future.done():
         _raise_inactivity_timeout(agent, job_name, _cron_inactivity_limit)
 
     if not isinstance(result, dict):

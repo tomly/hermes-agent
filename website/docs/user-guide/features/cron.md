@@ -441,6 +441,28 @@ prove completion. Restoring the ledger itself to an older backup also removes
 that evidence. External fire callbacks identify the currently accepted store
 claim, not an upstream scheduled slot absent from the callback.
 
+### Run-time limit
+
+The inactivity budget kills a run that goes *quiet*, but the paths that can hang — a tool
+call blocked on a dead service, a provider that accepts the connection and never answers —
+keep reporting activity while they wait, so a wedged run can look busy forever (a real
+incident: a post-market report job stuck on a dead broker for over two hours until a
+restart killed it). Cron therefore also enforces a **wall-clock** cap per run: when a run
+exceeds it, the agent is hard-interrupted and the run is recorded as failed with the limit
+named. By default the cap is the same derived bound the execution ledger uses to declare a
+stale claim (`max(3 × HERMES_CRON_TIMEOUT, script timeout, 2 h)`), so a run never outlives
+the moment another process would treat it as wedged. Set an explicit limit, or `0` to
+disable the cap:
+
+```yaml
+# ~/.hermes/config.yaml
+cron:
+  max_run_seconds: 5400   # 90 minutes; 0 = unlimited
+```
+
+Legitimately long jobs keep working as long as they finish inside the cap — raise
+`max_run_seconds` above your longest expected run.
+
 ### Repeated-failure review nudge
 
 Each job tracks a `failure_streak` — consecutive failed runs (delivery

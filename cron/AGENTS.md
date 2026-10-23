@@ -21,6 +21,15 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   session is hard-interrupted so it cannot monopolise the scheduler, while a long-but-active job
   is never cut off. Attached scripts (pre-run or `no_agent`) are bounded separately by the script
   timeout (`_DEFAULT_SCRIPT_TIMEOUT`, 3600s).
+- **The run also has a wall-clock cap** (`_cron_wall_clock_seconds()`): `cron.max_run_seconds`
+  (config; `0` = unlimited), else the ledger's derived stale bound
+  (`max(3 × HERMES_CRON_TIMEOUT, script timeout, 7200)`). The idle clock alone cannot bound a run:
+  the wait paths that hang (tool calls on a dead service, a silent provider) heartbeat activity
+  while blocked (`sequential tool running (Ns)`, `waiting for provider response`), so a wedged run
+  looks busy forever — Bug 1468 hung 2h13m on a dead broker until an external restart. The cap is
+  the last-resort breaker: hard-interrupt, fail the run with the limit named. It derives from the
+  same bound the stale-claim sweep uses so the owner ends itself no later than the outside world
+  would disown it.
 - Catch-up window = half the period, clamped to 120s–2h; 120s grace for missed one-shots.
 - Every recurring occurrence is accounted for: `tick()` advances `next_run_at` BEFORE dispatch
   (at-most-once across a mid-run crash) and stamps `pending_slot` in the same save; a scan that
