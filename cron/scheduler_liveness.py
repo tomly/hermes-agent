@@ -30,6 +30,7 @@ owner_progress: dict[str, float] = {}
 def _inactivity_watchdog_loop(
     *, get_idle_seconds: Callable[[], float], limit_s: float, poll_s: float, stop: threading.Event,
     future_done: Callable[[], bool], meter: Optional[AwakeIdleMeter] = None,
+    wall_limit_s: Optional[float] = None, verdict: Optional[dict] = None,
 ) -> bool:
     """Poll idle time until limit (-> True), stop, or the future completes (-> False). Uses
     ``threading.Event.wait``, not asyncio, so a blocked event loop cannot disable the watchdog.
@@ -37,19 +38,30 @@ def _inactivity_watchdog_loop(
     Driven by ``threading.Event.wait`` (a kernel timeout), not asyncio, so a blocked event-loop /
     ``run_job`` thread cannot disable this watchdog the way ``asyncio.sleep`` / ``wait_for`` would (family A
     of #94285 — the 4118s-idle-on-a-600s-limit cron hang). Returns True when *limit_s* of inactivity was
-    observed.
+    observed, or when *wall_limit_s* of wall-clock run time elapsed: tool and provider wait paths
+    heartbeat activity while they block, so a wedged run can look busy forever and the idle clock
+    alone never fires (Bug 1468 — the 2h13m ibkr-paper hang). Which edge fired is written to
+    ``verdict["reason"]`` (``"inactivity"`` / ``"runtime_limit"``); the deadline is computed from
+    THIS module's monotonic clock so callers faking their own time cannot split the domain.
     """
     # A sleeping host freezes the job with it, so time asleep never counts as inactivity.
     if meter is None:
         meter = AwakeIdleMeter()
+    wall_deadline = time.monotonic() + wall_limit_s if wall_limit_s is not None else None
     while not stop.wait(poll_s):
         if future_done():
             return False
+        if wall_deadline is not None and time.monotonic() >= wall_deadline:
+            if verdict is not None:
+                verdict["reason"] = "runtime_limit"
+            return True
         try:
             idle = float(get_idle_seconds() or 0.0)
         except Exception:
             idle = 0.0
         if meter.measure(idle) >= limit_s:
+            if verdict is not None:
+                verdict["reason"] = "inactivity"
             return True
     return False
 
