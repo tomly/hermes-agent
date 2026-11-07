@@ -46,6 +46,12 @@ def _fire(home, mode):
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(('HERMES_', '_HERMES_'))
            and not k.endswith(('_API_KEY', '_TOKEN'))}
+    # Suite isolation markers must survive the strip (see tests/conftest.py):
+    # without the lazy-install kill-switch the child treats the test home as a
+    # borrowing data root and runs a full borrowed-launch dependency sync
+    # instead of running on the test environment's interpreter.
+    env['HERMES_DISABLE_LAZY_INSTALLS'] = '1'
+    env['HERMES_TEST_ISOLATION'] = '1'
     env['HERMES_HOME'] = str(home)
     env['PYTHONPATH'] = str(Path(__file__).resolve().parents[2])
     result = subprocess.run([sys.executable, '-c', _FIRE, mode], env=env,

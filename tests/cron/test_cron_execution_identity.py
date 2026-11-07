@@ -64,6 +64,13 @@ def test_tool_hook_in_a_ticked_job_sees_its_execution_and_none_outside(tmp_path)
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("HERMES_", "_HERMES_"))
                and not k.endswith(("_API_KEY", "_TOKEN"))}
+        # Suite isolation markers must survive the strip (tests/conftest.py exports
+        # them process-wide exactly because tests rebuild child envs). Without the
+        # lazy-install kill-switch the child treats the test home as a borrowing
+        # data root and runs a full borrowed-launch dependency sync instead of
+        # running on the test environment's interpreter.
+        env["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
+        env["HERMES_TEST_ISOLATION"] = "1"
         env.update(HERMES_HOME=str(home), PYTHONPATH=str(Path(__file__).resolve().parents[2]))
         result = subprocess.run([sys.executable, "-c", _TICK], env=env, stdin=subprocess.DEVNULL,
                                 capture_output=True, text=True, timeout=180, check=False)

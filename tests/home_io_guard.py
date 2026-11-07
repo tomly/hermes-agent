@@ -49,6 +49,16 @@ _INTERPRETER_PREFIXES = tuple({
 _normcase = os.path.normcase
 _INTERPRETER_PREFIX_STRS = tuple(_normcase(os.fspath(p)) for p in _INTERPRETER_PREFIXES)
 
+# The payload marker BESIDE the checkout: a default install checks the repo out
+# INSIDE the home (install.sh: INSTALL_DIR=$HERMES_HOME/hermes-agent), so pm's
+# payload-layout probes (_payload_manifest, pm.runtime.is_runtime,
+# pm.paths.writable_store_root) stat/read the home's own manifest.json to decide
+# "is this tree a sealed payload?". Probing the marker is layout detection, not
+# reading Hermes state — same seam as the checkout exemption above, which stops
+# at the checkout's boundary. Reads and metadata are allowed; writes stay refused.
+_CHECKOUT_PARENT_MANIFEST = _normcase(
+    str(Path(__file__).resolve().parent.parent.parent / "manifest.json"))
+
 
 def _within(path: str, prefix: str) -> bool:
     """``Path(path).is_relative_to(prefix)`` for two normalized, case-folded absolute strings."""
@@ -120,6 +130,10 @@ class HomeIOGuard:
             for prefix in _INTERPRETER_PREFIX_STRS:
                 if _within(absolute, prefix) or (metadata and _contains(absolute, prefix)):
                     return
+            # The payload marker beside the checkout (see _CHECKOUT_PARENT_MANIFEST):
+            # reads and metadata are layout probing, never Hermes state mutation.
+            if not destructive and absolute == _CHECKOUT_PARENT_MANIFEST:
+                return
             # Check the lexical path first: resolving must not probe a protected
             # tree merely to decide that the original path was forbidden.
             for root in roots:
@@ -133,6 +147,8 @@ class HomeIOGuard:
             for prefix in _INTERPRETER_PREFIX_STRS:
                 if _within(resolved, prefix):
                     return
+            if not destructive and resolved == _CHECKOUT_PARENT_MANIFEST:
+                return
             for root in roots:
                 if _within(resolved, root):
                     self.refuse(value)
