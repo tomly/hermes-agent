@@ -960,3 +960,24 @@ def test_a_gone_target_retires_its_marker_only_over_a_clean_pre_tree(tmp_path, t
     assert marker.exists() is torn
     if torn:
         assert (root / "module.py").read_text(encoding="utf-8") == "def broken(:\n"  # never guessed back
+
+
+def test_restore_under_pytest_never_probes_the_live_checkout_marker(monkeypatch, tmp_path):
+    """Bug 1728: the pytest gate in ``restore_interrupted_pull`` must fire before the marker
+    probe, not after it.
+
+    A linked worktree's git dir resolves outside the checkout (the main install's
+    ``.git/worktrees/<name>``, inside the real home), so probing the live checkout's marker
+    under pytest is real-home I/O the test guard refuses — it broke every test that imports
+    an entry module lazily. Locked contract: under pytest the checkout running the suite is
+    skipped before any filesystem access, while a copied install (tmp_path) still reaches
+    the probe and stays eligible for real recovery.
+    """
+
+    def refuse_probe(root):
+        raise AssertionError(f"marker probed: {root}")
+
+    monkeypatch.setattr(er, "interrupted_pull_marker", refuse_probe)
+    assert er.restore_interrupted_pull() is False  # this checkout under pytest: gate first
+    with pytest.raises(AssertionError, match="marker probed"):
+        er.restore_interrupted_pull(tmp_path)  # a copied install is not the live checkout
